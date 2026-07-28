@@ -1,9 +1,10 @@
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit import log_event
 from app.core.auth import get_current_tenant
 from app.core.database import get_db
 from app.models.source import DataSource
@@ -30,6 +31,7 @@ async def create_source(
     db.add(source)
     await db.commit()
     await db.refresh(source)
+    await log_event(db, tenant.id, "source.created", "DataSource", str(source.id), tenant.email)
     return source
 
 
@@ -37,8 +39,15 @@ async def create_source(
 async def list_sources(
     tenant: Tenant = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
 ):
-    result = await db.execute(select(DataSource).where(DataSource.tenant_id == tenant.id))
+    result = await db.execute(
+        select(DataSource)
+        .where(DataSource.tenant_id == tenant.id)
+        .offset(skip)
+        .limit(limit)
+    )
     return result.scalars().all()
 
 
@@ -80,6 +89,7 @@ async def update_source(
 
     await db.commit()
     await db.refresh(source)
+    await log_event(db, tenant.id, "source.updated", "DataSource", str(source.id), tenant.email)
     return source
 
 
@@ -95,5 +105,6 @@ async def delete_source(
     source = result.scalar_one_or_none()
     if not source:
         raise HTTPException(status_code=404, detail="Data source not found")
+    await log_event(db, tenant.id, "source.deleted", "DataSource", str(source_id), tenant.email)
     await db.delete(source)
     await db.commit()

@@ -33,12 +33,21 @@ class SnapshotResponse(BaseModel):
     parent_snapshot_id: Optional[int]
     total_size_bytes: int
     dedup_size_bytes: int
+    dedup_ratio: float = 0.0
     chunk_count: int
     new_chunk_count: int
     average_entropy: float
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_orm_with_ratio(cls, obj):
+        data = cls.model_validate(obj)
+        if obj.total_size_bytes > 0:
+            saved = obj.total_size_bytes - obj.dedup_size_bytes
+            data.dedup_ratio = round(saved / obj.total_size_bytes, 4)
+        return data
 
 
 class RecoveryMetrics(BaseModel):

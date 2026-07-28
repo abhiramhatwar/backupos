@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.cas import CASStore
 from app.core.cdc import CDCChunker
 from app.core.config import settings
-from app.core.entropy import analyze_chunks, entropy_spike_detected
+from app.core.entropy import entropy_spike_detected
 from app.core.merkle import MerkleTree
 from app.workers.celery_app import celery_app
 
@@ -113,17 +113,20 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
                 logger.warning("source_path %s does not exist; creating empty snapshot", source_path)
 
             # ------------------------------------------------------------------
-            # 3. Store chunks in CAS
+            # 3. Store chunks in CAS — compute per-chunk entropy in the same pass
             # ------------------------------------------------------------------
             chunk_hashes: list[str] = []
             chunk_sizes: list[int] = []
             chunk_is_new: list[bool] = []
+            chunk_entropies: list[float] = []
 
+            from app.core.entropy import shannon_entropy as _entropy
             for chunk in all_chunks:
                 digest, is_new = cas.store(chunk)
                 chunk_hashes.append(digest)
                 chunk_sizes.append(len(chunk))
                 chunk_is_new.append(is_new)
+                chunk_entropies.append(_entropy(chunk))
 
             # ------------------------------------------------------------------
             # 4. Build Merkle tree
@@ -153,10 +156,9 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
                 new_hashes = set(chunk_hashes)
 
             # ------------------------------------------------------------------
-            # 5. Entropy analysis
+            # 5. Entropy analysis — reuse per-chunk values already computed
             # ------------------------------------------------------------------
-            entropy_stats = analyze_chunks(all_chunks)
-            avg_entropy = entropy_stats["average_entropy"]
+            avg_entropy = (sum(chunk_entropies) / len(chunk_entropies)) if chunk_entropies else 0.0
 
             # ------------------------------------------------------------------
             # 6. Persist BackupSnapshot
@@ -183,14 +185,14 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
             for digest, size, entropy_val, is_new_chunk in zip(
                 chunk_hashes,
                 chunk_sizes,
-                [analyze_chunks([c])["average_entropy"] for c in all_chunks] if all_chunks else [],
+                chunk_entropies,
                 chunk_is_new,
             ):
                 chunk_rec = BackupChunk(
                     snapshot_id=snapshot.id,
                     chunk_hash=digest,
                     size_bytes=size,
-                    entropy=0.0,
+                    entropy=entropy_val,
                     is_new=digest in new_hashes,
                 )
                 db.add(chunk_rec)

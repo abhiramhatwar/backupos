@@ -1,8 +1,9 @@
 import yaml
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit import log_event
 from app.core.auth import get_current_tenant
 from app.core.database import get_db
 from app.models.policy import BackupPolicy, PolicyAttachment
@@ -43,6 +44,7 @@ async def create_policy(
     db.add(policy)
     await db.commit()
     await db.refresh(policy)
+    await log_event(db, tenant.id, "policy.created", "BackupPolicy", str(policy.id), tenant.email)
     return policy
 
 
@@ -50,9 +52,14 @@ async def create_policy(
 async def list_policies(
     tenant: Tenant = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
 ):
     result = await db.execute(
-        select(BackupPolicy).where(BackupPolicy.tenant_id == tenant.id)
+        select(BackupPolicy)
+        .where(BackupPolicy.tenant_id == tenant.id)
+        .offset(skip)
+        .limit(limit)
     )
     return result.scalars().all()
 
@@ -117,6 +124,8 @@ async def attach_policy(
     attachment = PolicyAttachment(policy_id=policy_id, source_id=payload.source_id)
     db.add(attachment)
     await db.commit()
+    await log_event(db, tenant.id, "policy.attached", "BackupPolicy", str(policy_id), tenant.email,
+                    detail=f"source_id={payload.source_id}")
     return {"policy_id": policy_id, "source_id": payload.source_id, "message": "Policy attached"}
 
 
@@ -135,5 +144,6 @@ async def delete_policy(
     policy = result.scalar_one_or_none()
     if not policy:
         raise HTTPException(status_code=404, detail="Policy not found")
+    await log_event(db, tenant.id, "policy.deleted", "BackupPolicy", str(policy_id), tenant.email)
     await db.delete(policy)
     await db.commit()

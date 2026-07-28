@@ -39,3 +39,18 @@ class RateLimiter:
 
 # Singleton instance — initialised in app.main lifespan
 rate_limiter: RateLimiter | None = None
+
+
+async def check_rate_limit(tenant=None) -> None:
+    """
+    FastAPI dependency that enforces rate limiting for authenticated tenants.
+    Silently skips if the rate limiter is unavailable (Redis down).
+    """
+    if rate_limiter is None or tenant is None:
+        return
+    try:
+        await rate_limiter.check(tenant.id)
+    except HTTPException:
+        raise
+    except Exception:
+        pass

@@ -1,12 +1,14 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit import log_event
 from app.core.auth import get_current_tenant
 from app.core.database import get_db
+from app.core.rate_limit import check_rate_limit
 from app.models.backup import BackupJob, BackupSnapshot, JobStatus
 from app.models.policy import BackupPolicy, PolicyAttachment
 from app.models.source import DataSource
@@ -21,6 +23,7 @@ async def trigger_backup(
     payload: BackupJobCreate,
     tenant: Tenant = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
+    _: None = Depends(check_rate_limit),
 ):
     # Verify source ownership
     source_result = await db.execute(
@@ -41,6 +44,8 @@ async def trigger_backup(
     db.add(job)
     await db.commit()
     await db.refresh(job)
+    await log_event(db, tenant.id, "backup.triggered", "BackupJob", str(job.id), tenant.email,
+                    detail=f"type={payload.backup_type.value} source={source.id}")
 
     # Dispatch Celery task (import lazily to avoid circular imports at startup)
     try:
@@ -64,12 +69,16 @@ async def trigger_backup(
 async def list_backups(
     tenant: Tenant = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
 ):
     stmt = (
         select(BackupJob)
         .join(DataSource, BackupJob.source_id == DataSource.id)
         .where(DataSource.tenant_id == tenant.id)
         .order_by(BackupJob.created_at.desc())
+        .offset(skip)
+        .limit(limit)
     )
     result = await db.execute(stmt)
     return result.scalars().all()
@@ -98,8 +107,9 @@ async def source_history(
     source_id: int,
     tenant: Tenant = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
 ):
-    # Verify ownership
     source_result = await db.execute(
         select(DataSource).where(
             DataSource.id == source_id,
@@ -113,9 +123,11 @@ async def source_history(
         select(BackupSnapshot)
         .where(BackupSnapshot.source_id == source_id)
         .order_by(BackupSnapshot.created_at.desc())
+        .offset(skip)
+        .limit(limit)
     )
     result = await db.execute(stmt)
-    return result.scalars().all()
+    return [SnapshotResponse.from_orm_with_ratio(s) for s in result.scalars().all()]
 
 
 @router.get("/{source_id}/recovery-metrics", response_model=RecoveryMetrics)
@@ -184,10 +196,11 @@ async def recovery_metrics(
         if policy and current_rpo_minutes > policy.rpo_minutes:
             rpo_violated = True
 
-    # RTO estimate: chunk_count * 0.001 minutes
+    # RTO estimate: total_size / restore_throughput (assume 100 MB/s)
     estimated_rto_minutes: Optional[float] = None
-    if latest_snapshot:
-        estimated_rto_minutes = latest_snapshot.chunk_count * 0.001
+    if latest_snapshot and latest_snapshot.total_size_bytes > 0:
+        restore_bytes_per_minute = 100 * 1024 * 1024  # 100 MB/s
+        estimated_rto_minutes = round(latest_snapshot.total_size_bytes / restore_bytes_per_minute, 4)
 
     return RecoveryMetrics(
         source_id=source_id,
