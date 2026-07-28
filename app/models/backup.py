@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Integer, String, Text
@@ -54,6 +55,7 @@ class BackupSnapshot(Base):
 
     job = relationship("BackupJob", back_populates="snapshot")
     chunks = relationship("BackupChunk", back_populates="snapshot", cascade="all, delete-orphan")
+    files = relationship("SnapshotFile", back_populates="snapshot", cascade="all, delete-orphan")
 
 
 class BackupChunk(Base):
@@ -67,3 +69,27 @@ class BackupChunk(Base):
     is_new: Mapped[bool] = mapped_column(default=True)
 
     snapshot = relationship("BackupSnapshot", back_populates="chunks")
+
+
+class SnapshotFile(Base):
+    """Stores the per-file chunk manifest for a snapshot, enabling directory-tree restore."""
+
+    __tablename__ = "snapshot_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey("backup_snapshots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    file_size: Mapped[int] = mapped_column(BigInteger, default=0)
+    # JSON-encoded ordered list of SHA-256 chunk hashes for this file
+    chunk_hashes: Mapped[str] = mapped_column(Text, nullable=False)
+
+    snapshot = relationship("BackupSnapshot", back_populates="files")
+
+    def get_chunk_hashes(self) -> list[str]:
+        return json.loads(self.chunk_hashes)
+
+    @staticmethod
+    def encode_chunk_hashes(hashes: list[str]) -> str:
+        return json.dumps(hashes)

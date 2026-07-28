@@ -234,3 +234,7 @@ class TestEntropy:
     def test_entropy_spike_detected_false_small_jump(self):
         # High current but no spike (small delta)
         assert entropy_spike_detected(7.5, 7.0, threshold=7.2) is False
+
+    def test_entropy_spike_detected_false_zero_baseline(self):
+        # First backup has no baseline → must not fire a false alert
+        assert entropy_spike_detected(7.9, 0.0, threshold=7.2) is False

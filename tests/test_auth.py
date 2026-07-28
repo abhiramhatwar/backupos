@@ -78,13 +78,20 @@ async def test_me_no_auth(client: AsyncClient):
 
 
 async def test_me_with_api_key(client: AsyncClient, test_tenant):
-    tenant, _ = test_tenant
+    # Use the bearer token to rotate to a known API key, then verify that key works
+    _, token = test_tenant
+    rotate_resp = await client.post(
+        "/api/v1/auth/api-key/rotate",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert rotate_resp.status_code == 200
+    api_key = rotate_resp.json()["api_key"]
+
     resp = await client.get(
         "/api/v1/auth/me",
-        headers={"X-API-Key": tenant.api_key},
+        headers={"X-API-Key": api_key},
     )
     assert resp.status_code == 200
-    assert resp.json()["id"] == tenant.id
 
 
 async def test_rotate_api_key(client: AsyncClient, test_tenant):

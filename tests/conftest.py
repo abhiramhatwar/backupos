@@ -5,12 +5,14 @@ Uses an in-memory SQLite database (via aiosqlite) so tests run without
 a real PostgreSQL instance.
 """
 import asyncio
+import itertools
 from typing import AsyncGenerator
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 # Override DATABASE_URL before the app is imported so settings picks it up
 import os
@@ -23,6 +25,9 @@ from app.core.database import Base
 from app.core.auth import hash_password, create_access_token
 from app.models.tenant import Tenant
 
+# Unique-per-invocation counter so each test_tenant call gets a distinct email
+_tenant_counter = itertools.count(1)
+
 # ---------------------------------------------------------------------------
 # In-memory async engine (SQLite via aiosqlite)
 # ---------------------------------------------------------------------------
@@ -32,6 +37,7 @@ test_engine = create_async_engine(
     TEST_DB_URL,
     echo=False,
     connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
 )
 TestSessionLocal = async_sessionmaker(test_engine, expire_on_commit=False)
 
@@ -97,11 +103,12 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
 @pytest_asyncio.fixture
 async def test_tenant(db_session: AsyncSession):
     """Create a test tenant and return (tenant, jwt_token)."""
+    n = next(_tenant_counter)
     tenant = Tenant(
         name="Test Tenant",
-        email="test@example.com",
+        email=f"test_{n}@example.com",
         hashed_password=hash_password("testpassword"),
-        api_key="bos_test_api_key_12345",
+        api_key=f"bos_test_api_key_{n:05d}",
         is_active=True,
     )
     db_session.add(tenant)

@@ -75,6 +75,7 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
         BackupSnapshot,
         BackupType,
         JobStatus,
+        SnapshotFile,
     )
     from app.models.policy import BackupPolicy, PolicyAttachment
 
@@ -95,18 +96,28 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
         try:
             # ------------------------------------------------------------------
             # 2. Collect all files under source_path
+            #    file_manifest maps relative_path -> (file_size, [chunk_bytes])
             # ------------------------------------------------------------------
             all_chunks: list[bytes] = []
+            file_manifest: list[tuple[str, int, list[bytes]]] = []  # (rel_path, size, chunks)
+
             if os.path.isfile(source_path):
-                all_chunks = chunker.chunk_data(open(source_path, "rb").read())
+                with open(source_path, "rb") as f:
+                    data = f.read()
+                file_chunks = chunker.chunk_data(data)
+                all_chunks.extend(file_chunks)
+                file_manifest.append((os.path.basename(source_path), len(data), file_chunks))
             elif os.path.isdir(source_path):
                 for root, _dirs, files in os.walk(source_path):
                     for fname in sorted(files):
                         fpath = os.path.join(root, fname)
+                        rel_path = os.path.relpath(fpath, source_path)
                         try:
                             with open(fpath, "rb") as f:
                                 data = f.read()
-                            all_chunks.extend(chunker.chunk_data(data))
+                            file_chunks = chunker.chunk_data(data)
+                            all_chunks.extend(file_chunks)
+                            file_manifest.append((rel_path, len(data), file_chunks))
                         except OSError as exc:
                             logger.warning("Skipping %s: %s", fpath, exc)
             else:
@@ -164,7 +175,8 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
             # 6. Persist BackupSnapshot
             # ------------------------------------------------------------------
             total_size = sum(chunk_sizes)
-            dedup_size = sum(s for s, is_new in zip(chunk_sizes, chunk_is_new) if is_new)
+            # dedup_size_bytes = bytes that were already in CAS (saved by dedup)
+            dedup_size = sum(s for s, is_new in zip(chunk_sizes, chunk_is_new) if not is_new)
             new_count = sum(1 for h in chunk_hashes if h in new_hashes)
 
             snapshot = BackupSnapshot(
@@ -196,6 +208,21 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
                     is_new=digest in new_hashes,
                 )
                 db.add(chunk_rec)
+
+            # Persist per-file chunk manifests for directory-tree restore
+            chunk_offset = 0
+            for rel_path, file_size, file_chunks in file_manifest:
+                file_hashes = []
+                for fc in file_chunks:
+                    file_hashes.append(chunk_hashes[chunk_offset])
+                    chunk_offset += 1
+                sf = SnapshotFile(
+                    snapshot_id=snapshot.id,
+                    file_path=rel_path,
+                    file_size=file_size,
+                    chunk_hashes=SnapshotFile.encode_chunk_hashes(file_hashes),
+                )
+                db.add(sf)
 
             db.commit()
 

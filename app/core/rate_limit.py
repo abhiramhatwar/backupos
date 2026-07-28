@@ -41,15 +41,15 @@ class RateLimiter:
 rate_limiter: RateLimiter | None = None
 
 
-async def check_rate_limit(tenant=None) -> None:
+async def enforce_rate_limit(tenant_id: int) -> None:
     """
-    FastAPI dependency that enforces rate limiting for authenticated tenants.
-    Silently skips if the rate limiter is unavailable (Redis down).
+    Enforce rate limiting for a tenant.  Call directly from route handlers
+    after resolving the current tenant.  Silently skips if Redis is down.
     """
-    if rate_limiter is None or tenant is None:
+    if rate_limiter is None:
         return
     try:
-        await rate_limiter.check(tenant.id)
+        await rate_limiter.check(tenant_id)
     except HTTPException:
         raise
     except Exception:

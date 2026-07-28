@@ -2,13 +2,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import log_event
 from app.core.auth import get_current_tenant
 from app.core.database import get_db
-from app.core.rate_limit import check_rate_limit
+from app.core.rate_limit import enforce_rate_limit
 from app.models.backup import BackupJob, BackupSnapshot, JobStatus
 from app.models.policy import BackupPolicy, PolicyAttachment
 from app.models.source import DataSource
@@ -23,8 +23,9 @@ async def trigger_backup(
     payload: BackupJobCreate,
     tenant: Tenant = Depends(get_current_tenant),
     db: AsyncSession = Depends(get_db),
-    _: None = Depends(check_rate_limit),
 ):
+    await enforce_rate_limit(tenant.id)
+
     # Verify source ownership
     source_result = await db.execute(
         select(DataSource).where(
@@ -42,10 +43,10 @@ async def trigger_backup(
         status=JobStatus.pending,
     )
     db.add(job)
+    await log_event(db, tenant.id, "backup.triggered", "BackupJob", None, tenant.email,
+                    detail=f"type={payload.backup_type.value} source={source.id}")
     await db.commit()
     await db.refresh(job)
-    await log_event(db, tenant.id, "backup.triggered", "BackupJob", str(job.id), tenant.email,
-                    detail=f"type={payload.backup_type.value} source={source.id}")
 
     # Dispatch Celery task (import lazily to avoid circular imports at startup)
     try:
@@ -168,10 +169,11 @@ async def recovery_metrics(
     )
     latest_snapshot = (await db.execute(latest_snapshot_stmt)).scalar_one_or_none()
 
-    # Count total snapshots
-    all_snapshots_stmt = select(BackupSnapshot).where(BackupSnapshot.source_id == source_id)
-    all_snapshots = (await db.execute(all_snapshots_stmt)).scalars().all()
-    total_snapshots = len(all_snapshots)
+    # Count total snapshots via aggregate — avoids loading all rows into memory
+    count_result = await db.execute(
+        select(func.count(BackupSnapshot.id)).where(BackupSnapshot.source_id == source_id)
+    )
+    total_snapshots = count_result.scalar_one()
 
     # Attached policy for RPO comparison
     policy_stmt = (

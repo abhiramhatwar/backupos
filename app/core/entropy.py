@@ -14,8 +14,8 @@ def shannon_entropy(data: bytes) -> float:
     """
     Compute Shannon entropy in bits per byte (range 0.0 – 8.0).
 
-    * 0.0 = perfectly uniform byte value (e.g. b'\\x00' * n)
-    * 8.0 = every possible byte value appears equally often
+    * 0.0 = all bytes identical (degenerate distribution, e.g. b'\\x00' * n)
+    * 8.0 = all 256 byte values appear with equal frequency (maximum entropy)
     * >7.5 = highly compressed or encrypted data
     """
     if not data:
@@ -73,5 +73,10 @@ def entropy_spike_detected(
     """
     Return True if *current_avg* is suspicious (above threshold) AND it has
     jumped significantly (by more than 1.5 bits/byte) from *previous_avg*.
+
+    Returns False when previous_avg is 0.0 — no baseline has been established
+    yet (first backup), so no comparison is possible.
     """
+    if previous_avg == 0.0:
+        return False
     return current_avg > threshold and (current_avg - previous_avg) > 1.5

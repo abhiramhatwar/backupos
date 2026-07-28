@@ -82,7 +82,7 @@ async def evaluate_all_policies() -> None:
 
                 if last_job is None:
                     # No completed backup at all — dispatch an initial full backup
-                    _dispatch_backup(source.id, source.path, "full")
+                    await _dispatch_backup(db, source.id, source.path, "full")
                     continue
 
                 completed_at = last_job.completed_at
@@ -98,7 +98,7 @@ async def evaluate_all_policies() -> None:
                         source.id,
                         elapsed_minutes - policy.frequency_minutes,
                     )
-                    _dispatch_backup(source.id, source.path, "incremental")
+                    await _dispatch_backup(db, source.id, source.path, "incremental")
 
                 # Check RPO violation
                 if elapsed_minutes > policy.rpo_minutes:
@@ -121,22 +121,59 @@ async def evaluate_all_policies() -> None:
                     )
                     db.add(alert)
 
+                # Check for backup gap (missed multiple consecutive windows)
+                if elapsed_minutes > 3 * policy.frequency_minutes:
+                    gap_alert = AnomalyAlert(
+                        source_id=source.id,
+                        alert_type=AlertType.backup_gap,
+                        severity=AlertSeverity.critical,
+                        detail=(
+                            f"Backup gap detected: {elapsed_minutes:.1f} minutes since last backup "
+                            f"exceeds 3× the policy frequency ({policy.frequency_minutes} min)."
+                        ),
+                        metric_value=elapsed_minutes,
+                        threshold_value=float(3 * policy.frequency_minutes),
+                    )
+                    db.add(gap_alert)
+
             await db.commit()
     except Exception:
         logger.exception("Error in evaluate_all_policies")
 
 
-def _dispatch_backup(source_id: int, source_path: str, backup_type: str) -> None:
-    """Import lazily to avoid circular imports at module load time."""
-    try:
-        from app.workers.backup_worker import run_backup  # noqa: F401
+async def _dispatch_backup(
+    db: AsyncSession,
+    source_id: int,
+    source_path: str,
+    backup_type: str,
+) -> None:
+    """
+    Create a BackupJob record, then dispatch the Celery task.
+    Creating the job first ensures the FK constraint on backup_snapshots
+    is satisfied when the worker writes its snapshot record.
+    """
+    from app.models.backup import BackupJob, BackupType, JobStatus
 
-        # We cannot create a BackupJob here (async context issue) so we just
-        # fire the task with job_id=0.  A proper integration would create the
-        # job record first; this is a best-effort scheduler dispatch.
-        run_backup.delay(0, source_path, source_id, backup_type)
+    job = BackupJob(
+        source_id=source_id,
+        backup_type=BackupType(backup_type),
+        status=JobStatus.pending,
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    try:
+        from app.workers.backup_worker import run_backup
+
+        task = run_backup.delay(job.id, source_path, source_id, backup_type)
+        job.celery_task_id = task.id
+        await db.commit()
     except Exception:
         logger.exception("Failed to dispatch backup for source %d", source_id)
+        job.status = JobStatus.failed
+        job.error_message = "Celery broker unavailable"
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------

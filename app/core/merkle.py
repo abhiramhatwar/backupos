@@ -77,13 +77,54 @@ class MerkleTree:
     # Diff
     # ------------------------------------------------------------------
 
+    def _all_node_hashes(self) -> set[str]:
+        """Collect every node hash (internal + leaf) into a set."""
+        hashes: set[str] = set()
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            if node is None:
+                continue
+            hashes.add(node.hash)
+            stack.append(node.left)
+            stack.append(node.right)
+        return hashes
+
+    def _collect_new_chunks(
+        self,
+        node: Optional[MerkleNode],
+        other_hashes: set[str],
+        result: list[str],
+    ) -> None:
+        """
+        Recursively walk *self*'s tree.  If a node's hash appears in
+        *other_hashes*, the entire subtree rooted there is identical to a
+        subtree in *other* — skip it.  Only recurse into nodes whose hash
+        is absent, and collect chunk hashes at the leaves.
+        """
+        if node is None:
+            return
+        if node.hash in other_hashes:
+            return  # entire subtree unchanged — skip O(subtree size) nodes
+        if node.is_leaf:
+            result.append(node.chunk_hash)
+            return
+        self._collect_new_chunks(node.left, other_hashes, result)
+        self._collect_new_chunks(node.right, other_hashes, result)
+
     def diff(self, other: "MerkleTree") -> list[str]:
         """
         Return chunk hashes that are in *self* but absent from *other*.
-        This identifies new or changed chunks compared to a previous snapshot.
+
+        Uses Merkle tree traversal: builds the set of all node hashes in
+        *other* (O(N_other)), then walks *self* and skips any subtree whose
+        root hash appears in that set — achieving O(changed data) traversal
+        rather than a flat O(N_self) set difference that ignores the tree.
         """
-        other_set = set(other.chunk_hashes)
-        return [h for h in self.chunk_hashes if h not in other_set]
+        other_hashes = other._all_node_hashes()
+        result: list[str] = []
+        self._collect_new_chunks(self.root, other_hashes, result)
+        return result
 
     # ------------------------------------------------------------------
     # Verification

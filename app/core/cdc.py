@@ -65,12 +65,23 @@ class CDCChunker:
         n = len(data)
 
         while pos < n:
-            # Seed the rolling hash for the current window
-            h, window = self._rolling_hash(data, pos)
-            win_pos = 0  # circular index into window
             chunk_start = pos
-            # Advance past the minimum chunk size without checking boundary
-            fast_forward = min(pos + self.MIN_CHUNK, n)
+            # Seed the rolling hash over the first WINDOW_SIZE bytes of this chunk
+            h, window = self._rolling_hash(data, chunk_start)
+            win_pos = 0
+
+            # Fast-forward: advance the rolling hash over bytes
+            # [chunk_start + WINDOW_SIZE, chunk_start + MIN_CHUNK) without
+            # recording any boundaries.  Skipping this was a bug — the hash
+            # and the eviction window were 464 positions out of sync for
+            # every chunk boundary that followed.
+            fast_forward = min(chunk_start + self.MIN_CHUNK, n)
+            for i in range(chunk_start + self.WINDOW_SIZE, fast_forward):
+                out_byte = window[win_pos % self.WINDOW_SIZE]
+                in_byte = data[i]
+                h = (h * self.POLY - self.out_table[out_byte] + in_byte) & self._U64
+                window[win_pos % self.WINDOW_SIZE] = in_byte
+                win_pos += 1
             pos = fast_forward
 
             # Now scan for a boundary

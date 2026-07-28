@@ -29,9 +29,10 @@ async def create_source(
         tags=json.dumps(payload.tags),
     )
     db.add(source)
+    # Stage audit entry before committing so both records are atomic
+    await log_event(db, tenant.id, "source.created", "DataSource", None, tenant.email)
     await db.commit()
     await db.refresh(source)
-    await log_event(db, tenant.id, "source.created", "DataSource", str(source.id), tenant.email)
     return source
 
 
@@ -87,9 +88,9 @@ async def update_source(
     if payload.tags is not None:
         source.tags = json.dumps(payload.tags)
 
+    await log_event(db, tenant.id, "source.updated", "DataSource", str(source_id), tenant.email)
     await db.commit()
     await db.refresh(source)
-    await log_event(db, tenant.id, "source.updated", "DataSource", str(source.id), tenant.email)
     return source
 
 

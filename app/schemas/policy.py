@@ -24,6 +24,28 @@ class PolicyCreate(BaseModel):
         return v
 
 
+class PolicyUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    policy_yaml: Optional[str] = None
+    is_active: Optional[bool] = None
+
+    @field_validator("policy_yaml")
+    @classmethod
+    def validate_yaml(cls, v):
+        if v is None:
+            return v
+        try:
+            data = yaml.safe_load(v)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML: {e}")
+        required = ["frequency_minutes", "retention_days", "rpo_minutes"]
+        for field in required:
+            if field not in data:
+                raise ValueError(f"Missing required policy field: {field}")
+        return v
+
+
 class PolicyAttachRequest(BaseModel):
     source_id: int
 
