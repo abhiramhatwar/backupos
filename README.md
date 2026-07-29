@@ -29,6 +29,10 @@ This is not a thin wrapper around cloud storage. It implements the hard parts fr
   - [Rate limiting](#rate-limiting)
 - [Tech stack](#tech-stack)
 - [Getting started](#getting-started)
+  - [Option A — Docker](#option-a--docker-recommended-zero-setup)
+  - [Option B — Local Python](#option-b--local-python-no-docker)
+  - [First API call](#first-api-call--register-and-authenticate)
+  - [End-to-end walkthrough](#end-to-end-walkthrough)
 - [API reference](#api-reference)
 - [Policy format](#policy-format)
 - [Compliance framework mapping](#compliance-framework-mapping)
@@ -313,7 +317,7 @@ Redis token bucket per tenant. Key: `rate_limit:{tenant_id}`, TTL: 60 seconds. O
 |---|---|
 | API | FastAPI 0.115 + Pydantic v2 (fully async) |
 | Database | PostgreSQL 16 + SQLAlchemy 2.0 async |
-| Migrations | Alembic (003 migrations) |
+| Migrations | Alembic (4 migrations) |
 | Job queue | Celery 5 + Redis 7 |
 | Scheduling | APScheduler 3.10 (3 background jobs) |
 | Storage | Local filesystem CAS (SHA-256 addressed, zstd compressed) |
@@ -321,25 +325,203 @@ Redis token bucket per tenant. Key: `rate_limit:{tenant_id}`, TTL: 60 seconds. O
 | Rate limiting | Redis token bucket, 60 req/min per tenant |
 | Metrics | Prometheus (`/metrics` via prometheus-fastapi-instrumentator) |
 | Containers | Docker + docker-compose |
-| Testing | pytest-asyncio + httpx + aiosqlite (150 tests) |
+| Testing | pytest-asyncio + httpx + aiosqlite (208 tests) |
 
 ---
 
 ## Getting started
 
-**Prerequisites:** Docker and Docker Compose.
+### Option A — Docker (recommended, zero setup)
+
+**Prerequisites:** Docker Desktop (Mac/Windows) or Docker Engine + Docker Compose (Linux).
 
 ```bash
+# 1. Clone
 git clone https://github.com/abhiramhatwar/backupos
 cd backupos
+
+# 2. Start everything
 docker-compose up --build
 ```
 
-This starts four containers: PostgreSQL 16, Redis 7, the FastAPI API server, and a Celery worker pool (4 concurrent workers). Alembic migrations run automatically on API startup.
+This command builds and starts four containers:
 
-- Interactive docs: [http://localhost:8000/docs](http://localhost:8000/docs)
-- Redoc: [http://localhost:8000/redoc](http://localhost:8000/redoc)
-- Prometheus metrics: [http://localhost:8000/metrics](http://localhost:8000/metrics)
+| Container | Role | Port |
+|---|---|---|
+| `db` | PostgreSQL 16 | 5432 (internal) |
+| `redis` | Redis 7 | 6379 (internal) |
+| `api` | FastAPI + Uvicorn | **8000** |
+| `worker` | Celery worker pool (4 processes) | — |
+
+Database migrations run automatically the moment the API container starts. Wait for this log line before making requests:
+
+```
+api_1     | INFO:     Application startup complete.
+```
+
+**Verify it's healthy:**
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","service":"BackupOS"}
+```
+
+Open the interactive API explorer: **http://localhost:8000/docs**
+
+---
+
+### Option B — Local Python (no Docker)
+
+Use this if you want to run tests, iterate quickly, or do not have Docker.
+
+**Prerequisites:** Python 3.10+, PostgreSQL 14+, Redis 6+.
+
+```bash
+# 1. Clone and enter the project
+git clone https://github.com/abhiramhatwar/backupos
+cd backupos
+
+# 2. Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Set environment variables
+#    Copy the sample file and edit as needed
+cp .env.example .env               # if present, otherwise set manually:
+
+export DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/backupos"
+export REDIS_URL="redis://localhost:6379/0"
+export SECRET_KEY="change-me-in-production"
+export CAS_STORE_PATH="/tmp/backupos-cas"
+
+# 5. Create the database (one time)
+psql -U postgres -c "CREATE DATABASE backupos;"
+
+# 6. Apply migrations
+alembic upgrade head
+
+# 7. Start the API server
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# 8. (Optional) Start a Celery worker in a second terminal
+celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+```
+
+The API is now at **http://localhost:8000**. Without the Celery worker, backup and restore jobs will be created but will fail at dispatch and immediately marked `failed` — all read-only and metadata endpoints still work.
+
+---
+
+### First API call — register and authenticate
+
+All protected endpoints require a JWT. Create an account first:
+
+```bash
+# Register a tenant
+curl -s -X POST http://localhost:8000/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"password123"}' | jq .
+
+# Get a JWT
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"password123"}' | jq -r .access_token)
+
+echo "Token: $TOKEN"
+
+# Verify it works
+curl -s http://localhost:8000/api/v1/auth/me \
+  -H "Authorization: Bearer $TOKEN" | jq .
+```
+
+Use the token on every subsequent request via `-H "Authorization: Bearer $TOKEN"` or paste it into the Swagger UI **Authorize** button at http://localhost:8000/docs.
+
+---
+
+### End-to-end walkthrough
+
+```bash
+# 1. Create a data source
+SOURCE=$(curl -s -X POST http://localhost:8000/api/v1/sources \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"My Files","source_type":"directory","path":"/tmp/mydata","classification":"internal"}' | jq .)
+SOURCE_ID=$(echo $SOURCE | jq -r .id)
+echo "Source ID: $SOURCE_ID"
+
+# 2. Create a backup policy
+POLICY=$(curl -s -X POST http://localhost:8000/api/v1/policies \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Standard Policy",
+    "policy_yaml": "frequency_minutes: 360\nretention_days: 90\nrpo_minutes: 720\nrequire_checksum: true\nentropy_threshold: 7.2"
+  }' | jq .)
+POLICY_ID=$(echo $POLICY | jq -r .id)
+
+# 3. Attach the policy to the source
+curl -s -X POST http://localhost:8000/api/v1/policies/$POLICY_ID/attach \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"source_id\": $SOURCE_ID}" | jq .
+
+# 4. Trigger a full backup
+JOB=$(curl -s -X POST http://localhost:8000/api/v1/backups \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"source_id\": $SOURCE_ID, \"backup_type\": \"full\"}" | jq .)
+JOB_ID=$(echo $JOB | jq -r .id)
+echo "Backup job ID: $JOB_ID"
+
+# 5. Poll until done
+curl -s http://localhost:8000/api/v1/backups/$JOB_ID \
+  -H "Authorization: Bearer $TOKEN" | jq '{status: .status, error: .error_message}'
+
+# 6. Check recovery metrics
+curl -s http://localhost:8000/api/v1/backups/$SOURCE_ID/recovery-metrics \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# 7. Browse the snapshot filesystem (no restore needed)
+SNAP_ID=$(curl -s "http://localhost:8000/api/v1/backups/$SOURCE_ID/history" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[0].id')
+
+curl -s "http://localhost:8000/api/v1/sources/$SOURCE_ID/snapshots/$SNAP_ID/browse?path=/" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# 8. Estimate restore cost before triggering restore
+curl -s -X POST http://localhost:8000/api/v1/restore/estimate \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"source_id\": $SOURCE_ID}" | jq .
+
+# 9. View the backup chain dependency graph
+curl -s http://localhost:8000/api/v1/sources/$SOURCE_ID/chain \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# 10. Export the signed audit log
+curl -s "http://localhost:8000/api/v1/compliance/audit-export" \
+  -H "Authorization: Bearer $TOKEN" | jq '{event_count, signature, algorithm}'
+```
+
+---
+
+### Run the automated demo
+
+With Docker running:
+
+```bash
+docker-compose exec api python scripts/demo.py
+```
+
+Or locally (with the API on port 8000):
+
+```bash
+python scripts/demo.py
+```
+
+The script registers a tenant, creates a source and policy, runs full and incremental backups, synthesizes a chain-free full snapshot, searches the catalog, and prints a compliance report.
 
 ---
 
@@ -382,8 +564,11 @@ Source classifications: `internal`, `pii`, `financial`, `public`
 | `GET` | `/backups/{source_id}/history` | Snapshot history |
 | `GET` | `/backups/{source_id}/recovery-metrics` | RPO/RTO metrics |
 | `POST` | `/backups/{source_id}/synthesize-full` | Synthesize a chain-free full snapshot (metadata-only) |
+| `POST` | `/backups/{source_id}/sample-change-rate` | Estimate how much data changed since last backup — returns `should_backup` flag |
 
 Backup types: `full` (all chunks), `incremental` (Merkle diff against last snapshot)
+
+**Change rate sampling** draws a random sample of chunk hashes from the latest snapshot and checks how many are absent from the previous snapshot. If fewer than 1% of sampled chunks changed, the backup is skippable. Configurable via `sample_size` and `change_threshold` query params.
 
 ### Snapshots
 
@@ -426,6 +611,38 @@ The `catalog` endpoint accepts a `snapshot_id` query parameter to search a speci
 | `POST` | `/restore` | Trigger a restore job (full snapshot or single file via `file_path`) |
 | `GET` | `/restore/{job_id}` | Restore job status |
 | `GET` | `/restore/{source_id}/verify/{snapshot_id}` | Verify Merkle integrity on demand |
+| `POST` | `/restore/estimate` | Dry-run cost estimate — chunk count, bytes to read, estimated seconds, no CAS I/O |
+
+**Restore estimate** aggregates chunk data from `SnapshotFile` manifests and uses `BackupChunk.compressed_size_bytes` for accurate byte estimates. Accepts an optional `file_path` to narrow the estimate to a single file. Returns deduplication savings (how many redundant chunk reads are avoided) alongside the time estimate.
+
+### Virtual filesystem browser
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/sources/{source_id}/snapshots/{snapshot_id}/browse` | Browse a snapshot as a filesystem — `?path=/var/www` |
+
+No restore is performed. The tree is reconstructed in memory from `SnapshotFile` path records. Returns directories and files sorted dirs-first, with `child_count` for directories and `chunk_count` and `size` for files.
+
+### Backup chain
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/sources/{source_id}/chain` | Full DAG of snapshots with parent links, child lists, depth, lock status, and safe-to-delete flag |
+
+A node is marked `safe_to_delete: true` when it has no child snapshots currently in the system and is not WORM-locked. Use this before pruning to identify which snapshots can be safely removed immediately.
+
+### Webhooks
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/webhooks` | Register a webhook endpoint (auto-generates HMAC secret) |
+| `GET` | `/webhooks` | List all registered endpoints |
+| `GET` | `/webhooks/{id}` | Get one endpoint (secret is never returned; 4-char hint only) |
+| `DELETE` | `/webhooks/{id}` | Delete endpoint and all delivery history |
+| `GET` | `/webhooks/{id}/deliveries` | Last 100 delivery attempts with HTTP status and signature |
+| `POST` | `/webhooks/deliver` | Manually fire an event to a specific endpoint (for integration testing) |
+
+Every delivery is signed with `HMAC-SHA256` and sent in the `X-BackupOS-Signature: sha256=<hex>` header. Delivery failures are recorded but do not block the caller.
 
 ### Anomalies and compliance
 
@@ -436,8 +653,12 @@ The `catalog` endpoint accepts a `snapshot_id` query parameter to search a speci
 | `POST` | `/anomalies/{alert_id}/resolve` | Resolve an alert |
 | `GET` | `/anomalies/compliance/score` | Per-tenant compliance score (0–100) |
 | `GET` | `/anomalies/compliance/report` | Full report with per-source violations |
+| `GET` | `/compliance/audit-export` | Export full audit log as a signed JSON compliance artifact |
+| `GET` | `/compliance/audit-export/verify` | Re-derive the export signature to confirm a stored artifact is intact |
 
 Alert types: `entropy_spike`, `backup_gap`, `rpo_violation`, `dedup_ratio_collapse`
+
+**Signed audit export** uses a per-tenant HMAC-SHA256 derived key. Each event is serialised to canonical JSON (sorted keys), all rows are joined with `\n`, and a single digest is computed over the result. Downstream compliance systems can verify the export by reproducing the same digest. Supports `since`, `until`, `event_type`, and `limit` query params.
 
 ### WebSocket
 
@@ -494,18 +715,24 @@ pytest tests/ -v
 ```
 
 ```
-tests/test_core.py            29 tests  — CDC, CAS (dedup, compression, delete), Merkle tree, entropy (chi², EWMA)
-tests/test_auth.py             9 tests  — register, JWT, API key auth, key rotation
-tests/test_compliance.py      15 tests  — SOC 2, HIPAA, PCI scoring logic (pure unit)
-tests/test_rate_limit.py       6 tests  — token bucket, Redis degradation paths
-tests/test_policies.py        18 tests  — CRUD, PATCH, attach, tenant isolation
-tests/test_anomalies.py       12 tests  — alert listing, compliance HTTP endpoints
-tests/test_backups.py         13 tests  — trigger, list, history, recovery metrics
-tests/test_sources.py          8 tests  — source CRUD, tenant isolation
-tests/test_new_features.py    16 tests  — WORM lock, synthetic full, catalog search,
-                                          file history, analytics, recovery verification
+tests/test_core.py               29 tests  — CDC, CAS (dedup, compression, delete), Merkle tree, entropy (chi², EWMA)
+tests/test_auth.py                9 tests  — register, JWT, API key auth, key rotation
+tests/test_compliance.py         15 tests  — SOC 2, HIPAA, PCI scoring logic (pure unit)
+tests/test_rate_limit.py          6 tests  — token bucket, Redis degradation paths
+tests/test_policies.py           18 tests  — CRUD, PATCH, attach, tenant isolation
+tests/test_anomalies.py          12 tests  — alert listing, compliance HTTP endpoints
+tests/test_backups.py            13 tests  — trigger, list, history, recovery metrics
+tests/test_sources.py             8 tests  — source CRUD, tenant isolation
+tests/test_new_features.py       16 tests  — WORM lock, synthetic full, catalog search,
+                                             file history, analytics, recovery verification
+tests/test_browse.py             12 tests  — virtual filesystem browser, unit + integration
+tests/test_restore_estimate.py   10 tests  — dry-run estimate, dedup savings, byte formula
+tests/test_chain.py               8 tests  — DAG structure, safe-to-delete, lock propagation
+tests/test_change_rate.py         8 tests  — no-change, full-change, partial, threshold logic
+tests/test_webhooks.py           10 tests  — CRUD, HMAC signing, delivery history
+tests/test_compliance_export.py  10 tests  — signed export, verify endpoint, signing helpers
 
-150 tests total, 0 failures
+208 tests total, 0 failures
 ```
 
 With coverage:
