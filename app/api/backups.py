@@ -1,3 +1,4 @@
+import random
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -215,6 +216,142 @@ async def recovery_metrics(
         total_snapshots=total_snapshots,
         latest_snapshot_id=latest_snapshot.id if latest_snapshot else None,
         latest_merkle_root=latest_snapshot.merkle_root if latest_snapshot else None,
+    )
+
+
+_CHANGE_RATE_SAMPLE_SIZE = 200  # chunks to sample per source
+
+
+class ChangeRateSampleResponse(BaseModel):
+    source_id: int
+    latest_snapshot_id: int
+    previous_snapshot_id: Optional[int]
+    sample_size: int
+    changed_chunks: int
+    estimated_change_rate: float
+    should_backup: bool
+    reason: str
+
+
+@router.post("/{source_id}/sample-change-rate", response_model=ChangeRateSampleResponse)
+async def sample_change_rate(
+    source_id: int,
+    sample_size: int = Query(_CHANGE_RATE_SAMPLE_SIZE, ge=10, le=2000),
+    change_threshold: float = Query(0.01, ge=0.0, le=1.0, description="Minimum change rate to recommend a backup"),
+    tenant: Tenant = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Estimate how much data has changed since the last backup.
+
+    Loads chunk hashes from the two most recent snapshots, draws a random
+    sample of *sample_size* hashes from the latest snapshot, and computes
+    the fraction that do NOT appear in the previous snapshot.  That fraction
+    is the estimated change rate.
+
+    Returns should_backup=True when the estimated change rate meets or
+    exceeds *change_threshold* (default 1%).  Callers can use this to
+    avoid dispatching a backup job when data is effectively unchanged.
+
+    If there is only one snapshot (no baseline for comparison), should_backup
+    is always True.
+    """
+    source_result = await db.execute(
+        select(DataSource).where(
+            DataSource.id == source_id,
+            DataSource.tenant_id == tenant.id,
+        )
+    )
+    if not source_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Data source not found")
+
+    # Fetch the two most recent snapshots
+    recent_stmt = (
+        select(BackupSnapshot)
+        .where(BackupSnapshot.source_id == source_id)
+        .order_by(BackupSnapshot.created_at.desc())
+        .limit(2)
+    )
+    recent = (await db.execute(recent_stmt)).scalars().all()
+
+    if not recent:
+        raise HTTPException(status_code=404, detail="No snapshots found for this source")
+
+    latest = recent[0]
+    previous = recent[1] if len(recent) > 1 else None
+
+    # Collect all chunk hashes from the latest snapshot
+    latest_sf = (
+        await db.execute(select(SnapshotFile).where(SnapshotFile.snapshot_id == latest.id))
+    ).scalars().all()
+
+    all_latest_hashes: list[str] = []
+    for sf in latest_sf:
+        all_latest_hashes.extend(sf.get_chunk_hashes())
+
+    if not all_latest_hashes:
+        return ChangeRateSampleResponse(
+            source_id=source_id,
+            latest_snapshot_id=latest.id,
+            previous_snapshot_id=previous.id if previous else None,
+            sample_size=0,
+            changed_chunks=0,
+            estimated_change_rate=0.0,
+            should_backup=True,
+            reason="Latest snapshot has no file records — run a full backup to establish baseline",
+        )
+
+    # No previous snapshot to compare against
+    if not previous:
+        return ChangeRateSampleResponse(
+            source_id=source_id,
+            latest_snapshot_id=latest.id,
+            previous_snapshot_id=None,
+            sample_size=len(all_latest_hashes),
+            changed_chunks=len(all_latest_hashes),
+            estimated_change_rate=1.0,
+            should_backup=True,
+            reason="No previous snapshot — first backup or chain gap; proceeding",
+        )
+
+    # Build a set of all hashes in the previous snapshot for O(1) lookup
+    prev_sf = (
+        await db.execute(select(SnapshotFile).where(SnapshotFile.snapshot_id == previous.id))
+    ).scalars().all()
+    prev_hash_set: set[str] = set()
+    for sf in prev_sf:
+        prev_hash_set.update(sf.get_chunk_hashes())
+
+    # Sample up to sample_size chunk references from the latest snapshot
+    if len(all_latest_hashes) > sample_size:
+        sampled = random.sample(all_latest_hashes, sample_size)
+    else:
+        sampled = list(all_latest_hashes)
+
+    changed = sum(1 for h in sampled if h not in prev_hash_set)
+    change_rate = changed / len(sampled) if sampled else 0.0
+    should_backup = change_rate >= change_threshold
+
+    if should_backup:
+        reason = (
+            f"{changed}/{len(sampled)} sampled chunks are new "
+            f"(~{change_rate:.1%} change rate ≥ {change_threshold:.1%} threshold)"
+        )
+    else:
+        reason = (
+            f"Only {changed}/{len(sampled)} sampled chunks changed "
+            f"(~{change_rate:.1%} < {change_threshold:.1%} threshold) — backup skippable"
+        )
+
+    return ChangeRateSampleResponse(
+        source_id=source_id,
+        latest_snapshot_id=latest.id,
+        previous_snapshot_id=previous.id,
+        sample_size=len(sampled),
+        changed_chunks=changed,
+        estimated_change_rate=round(change_rate, 6),
+        should_backup=should_backup,
+        reason=reason,
     )
 
 
