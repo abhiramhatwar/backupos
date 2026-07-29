@@ -62,9 +62,10 @@ class BackupChunk(Base):
     __tablename__ = "backup_chunks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    snapshot_id: Mapped[int] = mapped_column(ForeignKey("backup_snapshots.id"), nullable=False)
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("backup_snapshots.id"), nullable=False, index=True)
     chunk_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    compressed_size_bytes: Mapped[int] = mapped_column(Integer, nullable=True)
     entropy: Mapped[float] = mapped_column(default=0.0)
     is_new: Mapped[bool] = mapped_column(default=True)
 

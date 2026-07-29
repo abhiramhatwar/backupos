@@ -3,6 +3,14 @@ Shannon entropy analysis for ransomware / encryption detection.
 
 A Shannon entropy of >7.5 bits/byte is a strong signal that data is
 encrypted or compressed — a potential ransomware indicator.
+
+chi_squared_uniform_test() distinguishes *encrypted* data (uniform byte
+distribution, high p-value) from *compressed* data (non-uniform, low p-value).
+Both have high Shannon entropy, so entropy alone produces false positives.
+
+ewma_entropy_baseline() builds a stable historical baseline using exponential
+smoothing so that a single legitimately-high-entropy snapshot doesn't break
+the anomaly detector.
 """
 from __future__ import annotations
 
@@ -80,3 +88,53 @@ def entropy_spike_detected(
     if previous_avg == 0.0:
         return False
     return current_avg > threshold and (current_avg - previous_avg) > 1.5
+
+
+def chi_squared_uniform_test(data: bytes) -> float:
+    """
+    Goodness-of-fit test against a uniform distribution over all 256 byte values.
+
+    Returns a p-value:
+      * High p-value (>0.05): byte distribution looks uniform → likely *encrypted*
+        (ransomware encrypts data, producing near-perfectly-uniform byte histograms)
+      * Low p-value (<0.05): distribution is non-uniform → likely *compressed*
+        (compressors are not truly random; entropy is high but not maximally uniform)
+
+    Uses the Wilson–Hilferty normal approximation to the chi-squared CDF so that
+    the scipy dependency is avoided.  Requires at least 512 bytes; returns 0.5
+    (inconclusive) for smaller inputs.
+    """
+    if len(data) < 512:
+        return 0.5
+
+    counts = Counter(data)
+    n = len(data)
+    expected = n / 256.0
+
+    chi2 = sum((counts.get(b, 0) - expected) ** 2 / expected for b in range(256))
+
+    # Wilson–Hilferty approximation: (chi2/df)^(1/3) ≈ N(mu, sigma^2)
+    df = 255
+    mu = 1.0 - 2.0 / (9.0 * df)
+    sigma = math.sqrt(2.0 / (9.0 * df))
+    z = ((chi2 / df) ** (1.0 / 3.0) - mu) / sigma
+
+    # Upper-tail p-value: P(chi2_255 > chi2_observed)
+    return 0.5 * math.erfc(z / math.sqrt(2.0))
+
+
+def ewma_entropy_baseline(recent_entropies: list[float], alpha: float = 0.3) -> float:
+    """
+    Compute an Exponentially Weighted Moving Average of historical entropy values.
+
+    *recent_entropies* should be ordered oldest-first.  Alpha controls the
+    smoothing: higher values weight recent observations more heavily.
+
+    Returns 0.0 when the list is empty (no baseline established yet).
+    """
+    if not recent_entropies:
+        return 0.0
+    ewma = recent_entropies[0]
+    for val in recent_entropies[1:]:
+        ewma = alpha * val + (1.0 - alpha) * ewma
+    return ewma

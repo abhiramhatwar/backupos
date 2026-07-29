@@ -1,5 +1,4 @@
 import os
-import tempfile
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -10,7 +9,7 @@ from app.core.auth import get_current_tenant
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.merkle import MerkleTree
-from app.models.backup import BackupChunk, BackupJob, BackupSnapshot, JobStatus
+from app.models.backup import BackupChunk, BackupJob, BackupSnapshot, JobStatus, SnapshotFile
 from app.models.restore_job import RestoreJob
 from app.models.source import DataSource
 from app.models.tenant import Tenant
@@ -22,6 +21,7 @@ class RestoreRequest(BaseModel):
     source_id: int
     snapshot_id: int | None = None
     restore_path: str | None = None
+    file_path: str | None = None
 
 
 class RestoreJobResponse(BaseModel):
@@ -55,7 +55,6 @@ async def trigger_restore(
     db: AsyncSession = Depends(get_db),
 ):
     """Trigger a restore job.  Defaults to the latest snapshot for the source."""
-    # Verify source ownership
     source_result = await db.execute(
         select(DataSource).where(
             DataSource.id == payload.source_id,
@@ -66,7 +65,6 @@ async def trigger_restore(
     if not source:
         raise HTTPException(status_code=404, detail="Data source not found")
 
-    # Resolve snapshot
     if payload.snapshot_id:
         snapshot_result = await db.execute(
             select(BackupSnapshot).where(
@@ -79,7 +77,6 @@ async def trigger_restore(
             raise HTTPException(status_code=404, detail="Snapshot not found")
         snapshot_id = snapshot.id
     else:
-        # Latest snapshot for this source
         latest_stmt = (
             select(BackupSnapshot)
             .where(BackupSnapshot.source_id == payload.source_id)
@@ -105,11 +102,10 @@ async def trigger_restore(
     await db.commit()
     await db.refresh(job)
 
-    # Dispatch Celery task
     try:
         from app.workers.restore_worker import run_restore
 
-        task = run_restore.delay(job.id, snapshot_id, restore_path)
+        task = run_restore.delay(job.id, snapshot_id, restore_path, payload.file_path)
         job.celery_task_id = task.id
         await db.commit()
         await db.refresh(job)
@@ -148,10 +144,14 @@ async def verify_snapshot(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Verify snapshot integrity by recomputing the Merkle root from all stored
-    chunk hashes and comparing to the stored root.
+    Verify snapshot integrity by recomputing the Merkle root and comparing to the
+    stored root.
+
+    Uses SnapshotFile records (complete per-file chunk manifests) as the primary
+    source of truth.  This is correct even for incremental backups where only new
+    chunks are written to BackupChunk.  Falls back to BackupChunk records when no
+    SnapshotFile records exist (legacy snapshots).
     """
-    # Verify ownership
     source_result = await db.execute(
         select(DataSource).where(
             DataSource.id == source_id,
@@ -171,13 +171,26 @@ async def verify_snapshot(
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
 
-    chunks_result = await db.execute(
-        select(BackupChunk)
-        .where(BackupChunk.snapshot_id == snapshot_id)
-        .order_by(BackupChunk.id)
+    # Primary: reconstruct full chunk list from SnapshotFile manifests
+    sf_result = await db.execute(
+        select(SnapshotFile)
+        .where(SnapshotFile.snapshot_id == snapshot_id)
+        .order_by(SnapshotFile.id)
     )
-    chunk_records = chunks_result.scalars().all()
-    chunk_hashes = [c.chunk_hash for c in chunk_records]
+    sf_records = sf_result.scalars().all()
+
+    if sf_records:
+        chunk_hashes = []
+        for sf in sf_records:
+            chunk_hashes.extend(sf.get_chunk_hashes())
+    else:
+        # Legacy fallback: use BackupChunk records
+        chunks_result = await db.execute(
+            select(BackupChunk)
+            .where(BackupChunk.snapshot_id == snapshot_id)
+            .order_by(BackupChunk.id)
+        )
+        chunk_hashes = [c.chunk_hash for c in chunks_result.scalars().all()]
 
     computed_root = MerkleTree(chunk_hashes).root_hash
     is_valid = computed_root == snapshot.merkle_root

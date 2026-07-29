@@ -11,7 +11,13 @@ import pytest
 
 from app.core.cas import CASStore
 from app.core.cdc import CDCChunker
-from app.core.entropy import analyze_chunks, entropy_spike_detected, shannon_entropy
+from app.core.entropy import (
+    analyze_chunks,
+    chi_squared_uniform_test,
+    entropy_spike_detected,
+    ewma_entropy_baseline,
+    shannon_entropy,
+)
 from app.core.merkle import MerkleTree
 
 
@@ -79,11 +85,12 @@ class TestCASStore:
     def test_store_and_retrieve(self, tmp_path):
         cas = CASStore(str(tmp_path / "cas"))
         data = b"Hello, CAS!"
-        digest, is_new = cas.store(data)
+        digest, is_new, stored_bytes = cas.store(data)
 
         assert is_new is True
         assert isinstance(digest, str)
         assert len(digest) == 64  # SHA-256 hex
+        assert stored_bytes > 0
 
         retrieved = cas.retrieve(digest)
         assert retrieved == data
@@ -91,8 +98,8 @@ class TestCASStore:
     def test_dedup_second_store_is_not_new(self, tmp_path):
         cas = CASStore(str(tmp_path / "cas"))
         data = b"Duplicate chunk"
-        _, is_new_first = cas.store(data)
-        digest, is_new_second = cas.store(data)
+        _, is_new_first, _ = cas.store(data)
+        digest, is_new_second, _ = cas.store(data)
 
         assert is_new_first is True
         assert is_new_second is False  # dedup
@@ -100,7 +107,7 @@ class TestCASStore:
     def test_exists(self, tmp_path):
         cas = CASStore(str(tmp_path / "cas"))
         data = b"Exists test"
-        digest, _ = cas.store(data)
+        digest, *_ = cas.store(data)
         assert cas.exists(digest) is True
         assert cas.exists("0" * 64) is False
 
@@ -109,6 +116,15 @@ class TestCASStore:
         with pytest.raises(FileNotFoundError):
             cas.retrieve("a" * 64)
 
+    def test_delete(self, tmp_path):
+        cas = CASStore(str(tmp_path / "cas"))
+        data = b"delete me"
+        digest, *_ = cas.store(data)
+        assert cas.exists(digest) is True
+        assert cas.delete(digest) is True
+        assert cas.exists(digest) is False
+        assert cas.delete(digest) is False  # idempotent
+
     def test_total_size(self, tmp_path):
         cas = CASStore(str(tmp_path / "cas"))
         data1 = b"chunk one" * 10
@@ -116,14 +132,28 @@ class TestCASStore:
         cas.store(data1)
         cas.store(data2)
         size = cas.total_size()
-        assert size == len(data1) + len(data2)
+        # With transparent compression the on-disk size may be smaller than raw
+        assert 0 < size <= len(data1) + len(data2)
 
     def test_sha256_digest_correctness(self, tmp_path):
         cas = CASStore(str(tmp_path / "cas"))
         data = b"Known data"
         expected = hashlib.sha256(data).hexdigest()
-        digest, _ = cas.store(data)
+        digest, *_ = cas.store(data)
         assert digest == expected
+
+    def test_compression_is_transparent(self, tmp_path):
+        """retrieve() must return original bytes regardless of on-disk encoding."""
+        cas = CASStore(str(tmp_path / "cas"))
+        # Low-entropy data → will be compressed
+        data_low = b"\xAB\xCD" * 4096
+        digest, *_ = cas.store(data_low)
+        assert cas.retrieve(digest) == data_low
+
+        # High-entropy data → stored raw
+        data_high = os.urandom(4096)
+        digest2, *_ = cas.store(data_high)
+        assert cas.retrieve(digest2) == data_high
 
 
 # ===========================================================================
@@ -238,3 +268,37 @@ class TestEntropy:
     def test_entropy_spike_detected_false_zero_baseline(self):
         # First backup has no baseline → must not fire a false alert
         assert entropy_spike_detected(7.9, 0.0, threshold=7.2) is False
+
+    def test_chi_squared_encrypted_data(self):
+        data = os.urandom(4096)
+        p = chi_squared_uniform_test(data)
+        # Random bytes → near-uniform → high p-value
+        assert p > 0.01, f"Expected high p-value for random data, got {p}"
+
+    def test_chi_squared_repetitive_data(self):
+        data = (b"hello world " * 200)[:4096]
+        p = chi_squared_uniform_test(data)
+        # Non-uniform ASCII text → very low p-value
+        assert p < 0.01, f"Expected low p-value for repetitive text, got {p}"
+
+    def test_chi_squared_small_data_returns_inconclusive(self):
+        p = chi_squared_uniform_test(b"tiny")
+        assert p == 0.5
+
+    def test_ewma_entropy_baseline_empty(self):
+        assert ewma_entropy_baseline([]) == 0.0
+
+    def test_ewma_entropy_baseline_single(self):
+        assert ewma_entropy_baseline([5.0]) == 5.0
+
+    def test_ewma_entropy_baseline_weighted(self):
+        # With alpha=1.0 the result collapses to the last value
+        result = ewma_entropy_baseline([1.0, 2.0, 3.0], alpha=1.0)
+        assert result == 3.0
+
+    def test_ewma_entropy_baseline_smoothing(self):
+        # Baseline should be closer to older values when alpha is low
+        result_low = ewma_entropy_baseline([7.0, 3.0], alpha=0.1)
+        result_high = ewma_entropy_baseline([7.0, 3.0], alpha=0.9)
+        # Low alpha → more weight on history (7.0), so higher result
+        assert result_low > result_high

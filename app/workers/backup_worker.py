@@ -3,6 +3,25 @@ Celery task: run_backup
 
 Uses synchronous SQLAlchemy (psycopg2) because Celery workers do not have
 an asyncio event loop running.
+
+Key behaviours
+--------------
+* Incremental backups only write *new* chunks to the backup_chunks table;
+  chunks already stored in a previous snapshot are not re-recorded (dedup).
+  The full chunk manifest is preserved in SnapshotFile records so that
+  verify_snapshot and restore_worker can reconstruct the complete picture.
+
+* Entropy anomaly detection uses an EWMA baseline over the last 10 snapshots
+  rather than a single-snapshot comparison, so one legitimately high-entropy
+  backup doesn't permanently elevate the baseline.
+
+* A chi-squared uniformity test distinguishes *encrypted* data (uniform byte
+  histogram, high p-value) from *compressed* data (non-uniform, low p-value).
+  Both have high Shannon entropy but only encrypted data is suspicious.
+
+* Dedup-ratio collapse detection flags backups where the deduplication ratio
+  drops sharply relative to the recent rolling average — a strong signal that
+  data has been re-encrypted or scrambled by ransomware.
 """
 from __future__ import annotations
 
@@ -17,32 +36,28 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.cas import CASStore
 from app.core.cdc import CDCChunker
 from app.core.config import settings
-from app.core.entropy import entropy_spike_detected
+from app.core.entropy import (
+    chi_squared_uniform_test,
+    entropy_spike_detected,
+    ewma_entropy_baseline,
+    shannon_entropy as _entropy,
+)
 from app.core.merkle import MerkleTree
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Synchronous SQLAlchemy engine for Celery workers
-# ---------------------------------------------------------------------------
 _sync_url = settings.database_url.replace("+asyncpg", "")
 _engine = create_engine(_sync_url, pool_pre_ping=True)
 SyncSession: sessionmaker[Session] = sessionmaker(_engine, expire_on_commit=False)
 
-# ---------------------------------------------------------------------------
-# CAS store singleton
-# ---------------------------------------------------------------------------
 cas = CASStore(settings.cas_store_path)
 chunker = CDCChunker()
 
 
-# ---------------------------------------------------------------------------
-# Helper: update job status
-# ---------------------------------------------------------------------------
-
 def _update_job(db: Session, job_id: int, **kwargs) -> None:
     from app.models.backup import BackupJob
+
     job = db.get(BackupJob, job_id)
     if job is None:
         return
@@ -51,10 +66,6 @@ def _update_job(db: Session, job_id: int, **kwargs) -> None:
     db.commit()
 
 
-# ---------------------------------------------------------------------------
-# Main task
-# ---------------------------------------------------------------------------
-
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type: str):
     """
@@ -62,11 +73,12 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
 
     1. Mark job RUNNING
     2. Chunk all files under source_path with CDC
-    3. Store each chunk in CAS (deduplication is automatic)
+    3. Store each chunk in CAS (deduplication + compression are automatic)
     4. Build MerkleTree; diff against previous snapshot for incremental
-    5. Persist BackupSnapshot + BackupChunk records
-    6. Run anomaly detection (entropy spike, size anomaly)
-    7. Mark job COMPLETED
+    5. Persist BackupSnapshot + SnapshotFile records
+    6. Write BackupChunk records (new chunks only for incremental backups)
+    7. Run anomaly detection (entropy / dedup-ratio / size)
+    8. Mark job COMPLETED
     """
     from app.models.anomaly import AlertSeverity, AlertType, AnomalyAlert
     from app.models.backup import (
@@ -96,10 +108,9 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
         try:
             # ------------------------------------------------------------------
             # 2. Collect all files under source_path
-            #    file_manifest maps relative_path -> (file_size, [chunk_bytes])
             # ------------------------------------------------------------------
             all_chunks: list[bytes] = []
-            file_manifest: list[tuple[str, int, list[bytes]]] = []  # (rel_path, size, chunks)
+            file_manifest: list[tuple[str, int, list[bytes]]] = []
 
             if os.path.isfile(source_path):
                 with open(source_path, "rb") as f:
@@ -125,26 +136,28 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
 
             # ------------------------------------------------------------------
             # 3. Store chunks in CAS — compute per-chunk entropy in the same pass
+            #    CASStore.store() transparently compresses low-entropy chunks.
             # ------------------------------------------------------------------
             chunk_hashes: list[str] = []
             chunk_sizes: list[int] = []
+            chunk_stored_sizes: list[int] = []
             chunk_is_new: list[bool] = []
             chunk_entropies: list[float] = []
 
-            from app.core.entropy import shannon_entropy as _entropy
             for chunk in all_chunks:
-                digest, is_new = cas.store(chunk)
+                entropy_val = _entropy(chunk)
+                digest, is_new, stored_size = cas.store(chunk, entropy=entropy_val)
                 chunk_hashes.append(digest)
                 chunk_sizes.append(len(chunk))
+                chunk_stored_sizes.append(stored_size)
                 chunk_is_new.append(is_new)
-                chunk_entropies.append(_entropy(chunk))
+                chunk_entropies.append(entropy_val)
 
             # ------------------------------------------------------------------
-            # 4. Build Merkle tree
+            # 4. Build Merkle tree; compute diff against previous snapshot
             # ------------------------------------------------------------------
             tree = MerkleTree(chunk_hashes)
 
-            # Get previous snapshot for this source (for incremental diff)
             prev_snapshot = None
             if backup_type == BackupType.incremental or backup_type == "incremental":
                 prev_stmt = (
@@ -155,30 +168,30 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
                 )
                 prev_snapshot = db.execute(prev_stmt).scalar_one_or_none()
 
-            new_hashes: set[str] = set()
             if prev_snapshot is not None:
                 prev_hashes_stmt = select(BackupChunk.chunk_hash).where(
                     BackupChunk.snapshot_id == prev_snapshot.id
                 )
                 prev_hash_rows = db.execute(prev_hashes_stmt).scalars().all()
                 prev_tree = MerkleTree(list(prev_hash_rows))
-                new_hashes = set(tree.diff(prev_tree))
+                new_hashes: set[str] = set(tree.diff(prev_tree))
             else:
                 new_hashes = set(chunk_hashes)
 
             # ------------------------------------------------------------------
-            # 5. Entropy analysis — reuse per-chunk values already computed
+            # 5. Compute summary metrics
             # ------------------------------------------------------------------
             avg_entropy = (sum(chunk_entropies) / len(chunk_entropies)) if chunk_entropies else 0.0
-
-            # ------------------------------------------------------------------
-            # 6. Persist BackupSnapshot
-            # ------------------------------------------------------------------
             total_size = sum(chunk_sizes)
-            # dedup_size_bytes = bytes that were already in CAS (saved by dedup)
             dedup_size = sum(s for s, is_new in zip(chunk_sizes, chunk_is_new) if not is_new)
-            new_count = sum(1 for h in chunk_hashes if h in new_hashes)
+            new_count = len(new_hashes)
 
+            # ------------------------------------------------------------------
+            # 6. Persist BackupSnapshot, SnapshotFile manifests, and BackupChunks
+            #    For incremental backups, only new chunks are written to backup_chunks.
+            #    SnapshotFile records always contain the complete per-file hash list
+            #    so verify_snapshot and restore_worker always have the full picture.
+            # ------------------------------------------------------------------
             snapshot = BackupSnapshot(
                 job_id=job_id if job_id != 0 else 0,
                 source_id=source_id,
@@ -191,29 +204,13 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
                 average_entropy=avg_entropy,
             )
             db.add(snapshot)
-            db.flush()  # assign snapshot.id
+            db.flush()
 
-            # Persist chunk records
-            for digest, size, entropy_val, is_new_chunk in zip(
-                chunk_hashes,
-                chunk_sizes,
-                chunk_entropies,
-                chunk_is_new,
-            ):
-                chunk_rec = BackupChunk(
-                    snapshot_id=snapshot.id,
-                    chunk_hash=digest,
-                    size_bytes=size,
-                    entropy=entropy_val,
-                    is_new=digest in new_hashes,
-                )
-                db.add(chunk_rec)
-
-            # Persist per-file chunk manifests for directory-tree restore
+            # SnapshotFile: complete manifest (all chunks, new and inherited)
             chunk_offset = 0
             for rel_path, file_size, file_chunks in file_manifest:
                 file_hashes = []
-                for fc in file_chunks:
+                for _ in file_chunks:
                     file_hashes.append(chunk_hashes[chunk_offset])
                     chunk_offset += 1
                 sf = SnapshotFile(
@@ -224,24 +221,46 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
                 )
                 db.add(sf)
 
+            # BackupChunk: only new chunks (avoids re-recording inherited chunks)
+            for digest, size, stored_size, entropy_val in zip(
+                chunk_hashes,
+                chunk_sizes,
+                chunk_stored_sizes,
+                chunk_entropies,
+            ):
+                if digest not in new_hashes:
+                    continue
+                chunk_rec = BackupChunk(
+                    snapshot_id=snapshot.id,
+                    chunk_hash=digest,
+                    size_bytes=size,
+                    compressed_size_bytes=stored_size,
+                    entropy=entropy_val,
+                    is_new=True,
+                )
+                db.add(chunk_rec)
+
             db.commit()
 
             # ------------------------------------------------------------------
             # 7. Anomaly detection
             # ------------------------------------------------------------------
-            # Entropy spike
-            prev_avg_entropy = 0.0
-            if prev_snapshot is not None:
-                prev_avg_entropy = prev_snapshot.average_entropy or 0.0
+            # Gather recent snapshots for rolling baselines
+            recent_stmt = (
+                select(BackupSnapshot)
+                .where(BackupSnapshot.source_id == source_id)
+                .order_by(BackupSnapshot.created_at.desc())
+                .limit(10)
+            )
+            recent = db.execute(recent_stmt).scalars().all()
+            prev_snapshots = [s for s in recent if s.id != snapshot.id]
 
+            # --- Policy threshold ---
             policy_threshold = 7.5
             try:
                 policy_stmt = (
                     select(BackupPolicy)
-                    .join(
-                        PolicyAttachment,
-                        PolicyAttachment.policy_id == BackupPolicy.id,
-                    )
+                    .join(PolicyAttachment, PolicyAttachment.policy_id == BackupPolicy.id)
                     .where(PolicyAttachment.source_id == source_id)
                     .limit(1)
                 )
@@ -251,45 +270,78 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
             except Exception:
                 pass
 
-            if avg_entropy > policy_threshold or entropy_spike_detected(avg_entropy, prev_avg_entropy):
+            # --- EWMA entropy baseline (oldest-first for correct EWMA order) ---
+            historical_entropies = [
+                s.average_entropy for s in reversed(prev_snapshots) if s.average_entropy
+            ]
+            ewma_baseline = ewma_entropy_baseline(historical_entropies)
+
+            entropy_alert_fired = False
+            if avg_entropy > policy_threshold or entropy_spike_detected(avg_entropy, ewma_baseline):
+                # Chi-squared test: distinguish encrypted from merely-compressed data
+                sample = b"".join(all_chunks[:20]) if all_chunks else b""
+                p_value = chi_squared_uniform_test(sample)
+                is_encrypted = p_value > 0.05
+
+                detail = (
+                    f"High entropy detected: avg={avg_entropy:.3f} bits/byte "
+                    f"(threshold={policy_threshold}, EWMA baseline={ewma_baseline:.3f}). "
+                    f"Chi-squared p={p_value:.4f} → {'ENCRYPTED' if is_encrypted else 'compressed'}. "
+                    f"{'Possible ransomware activity.' if is_encrypted else 'Likely compressed data.'}"
+                )
                 alert = AnomalyAlert(
                     source_id=source_id,
                     alert_type=AlertType.entropy_spike,
-                    severity=AlertSeverity.high,
-                    detail=(
-                        f"High entropy detected: avg={avg_entropy:.3f} bits/byte "
-                        f"(threshold={policy_threshold}). Possible ransomware activity."
-                    ),
+                    severity=AlertSeverity.critical if is_encrypted else AlertSeverity.medium,
+                    detail=detail,
                     metric_value=avg_entropy,
                     threshold_value=policy_threshold,
                 )
                 db.add(alert)
+                entropy_alert_fired = True
 
-            # Size anomaly — compare to rolling average of last 5 snapshots
-            recent_stmt = (
-                select(BackupSnapshot)
-                .where(BackupSnapshot.source_id == source_id)
-                .order_by(BackupSnapshot.created_at.desc())
-                .limit(5)
-            )
-            recent = db.execute(recent_stmt).scalars().all()
-            if len(recent) >= 2:
-                sizes = [s.total_size_bytes for s in recent if s.id != snapshot.id]
-                if sizes:
-                    rolling_avg = sum(sizes) / len(sizes)
-                    if rolling_avg > 0 and total_size > 3 * rolling_avg:
-                        size_alert = AnomalyAlert(
+            # --- Dedup-ratio collapse detection ---
+            if prev_snapshots and total_size > 0:
+                recent_ratios = [
+                    s.dedup_size_bytes / s.total_size_bytes
+                    for s in prev_snapshots
+                    if s.total_size_bytes > 0
+                ]
+                if len(recent_ratios) >= 3:
+                    avg_dedup_ratio = sum(recent_ratios) / len(recent_ratios)
+                    current_dedup_ratio = dedup_size / total_size
+                    if avg_dedup_ratio > 0.3 and current_dedup_ratio < avg_dedup_ratio * 0.3:
+                        dedup_alert = AnomalyAlert(
                             source_id=source_id,
-                            alert_type=AlertType.size_anomaly,
+                            alert_type=AlertType.dedup_ratio_collapse,
                             severity=AlertSeverity.high,
                             detail=(
-                                f"Backup size anomaly: current={total_size} bytes is "
-                                f"{total_size/rolling_avg:.1f}x the rolling average ({rolling_avg:.0f} bytes)."
+                                f"Dedup ratio collapsed from rolling avg {avg_dedup_ratio:.1%} "
+                                f"to {current_dedup_ratio:.1%}. Data may have been re-encrypted "
+                                f"or replaced wholesale — possible ransomware activity."
                             ),
-                            metric_value=float(total_size),
-                            threshold_value=rolling_avg * 3,
+                            metric_value=current_dedup_ratio,
+                            threshold_value=avg_dedup_ratio * 0.3,
                         )
-                        db.add(size_alert)
+                        db.add(dedup_alert)
+
+            # --- Size anomaly (3× rolling average) ---
+            if len(prev_snapshots) >= 2:
+                sizes = [s.total_size_bytes for s in prev_snapshots]
+                rolling_avg = sum(sizes) / len(sizes)
+                if rolling_avg > 0 and total_size > 3 * rolling_avg:
+                    size_alert = AnomalyAlert(
+                        source_id=source_id,
+                        alert_type=AlertType.size_anomaly,
+                        severity=AlertSeverity.high,
+                        detail=(
+                            f"Backup size anomaly: current={total_size} bytes is "
+                            f"{total_size/rolling_avg:.1f}x the rolling average ({rolling_avg:.0f} bytes)."
+                        ),
+                        metric_value=float(total_size),
+                        threshold_value=rolling_avg * 3,
+                    )
+                    db.add(size_alert)
 
             db.commit()
 
@@ -304,11 +356,12 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
                     db.commit()
 
             logger.info(
-                "Backup job %d completed: %d chunks, %d new, merkle=%s",
+                "Backup job %d completed: %d chunks (%d new), merkle=%s, avg_entropy=%.3f",
                 job_id,
                 len(chunk_hashes),
                 new_count,
                 tree.root_hash[:12],
+                avg_entropy,
             )
 
         except Exception as exc:

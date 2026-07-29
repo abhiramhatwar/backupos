@@ -1,23 +1,30 @@
 """
-APScheduler configuration for periodic policy evaluation.
+APScheduler configuration for periodic policy evaluation and retention enforcement.
 
-The scheduler runs inside the FastAPI process and evaluates backup policies
-every 5 minutes.  For each source that has an attached policy it checks:
+Two jobs run inside the FastAPI process:
 
-  1. Is a new backup overdue?  (last completed + frequency_minutes < now)
-  2. Has the RPO been violated?  (last completed > rpo_minutes ago)
+  policy_evaluator  (every 5 min)
+    For each source with an active policy:
+      1. Skip if a backup job is already pending / running (dedup guard)
+      2. Dispatch a new backup job if the last completed one is overdue
+      3. Raise an RPO violation alert if the gap exceeds policy.rpo_minutes
+      4. Raise a backup-gap alert if the gap exceeds 3× the frequency window
 
-Overdue sources get a new Celery backup task dispatched.
-RPO violations produce an AnomalyAlert record.
+  retention_pruner  (every 60 min)
+    For each source with an active policy:
+      1. Find snapshots older than policy.retention_days
+      2. Delete them (cascades to BackupChunk / SnapshotFile via ORM)
+      3. GC CAS chunks that are no longer referenced by any remaining snapshot
+      4. Always keep at least the most-recent snapshot regardless of age
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import settings
@@ -58,7 +65,6 @@ async def evaluate_all_policies() -> None:
 
     try:
         async with SessionFactory() as db:
-            # Load all active policy attachments with their policy and source
             stmt = (
                 select(PolicyAttachment, BackupPolicy, DataSource)
                 .join(BackupPolicy, PolicyAttachment.policy_id == BackupPolicy.id)
@@ -68,6 +74,26 @@ async def evaluate_all_policies() -> None:
             rows = (await db.execute(stmt)).all()
 
             for attachment, policy, source in rows:
+                # --------------------------------------------------------
+                # Dedup guard: skip if a job is already in flight
+                # --------------------------------------------------------
+                active_stmt = (
+                    select(BackupJob.id)
+                    .where(
+                        BackupJob.source_id == source.id,
+                        BackupJob.status.in_([JobStatus.pending, JobStatus.running]),
+                    )
+                    .limit(1)
+                )
+                active_job_id = (await db.execute(active_stmt)).scalar_one_or_none()
+                if active_job_id is not None:
+                    logger.debug(
+                        "Skipping dispatch for source %d — job %d already active",
+                        source.id,
+                        active_job_id,
+                    )
+                    continue
+
                 # Find last completed backup job for this source
                 last_job_stmt = (
                     select(BackupJob)
@@ -81,7 +107,6 @@ async def evaluate_all_policies() -> None:
                 last_job = (await db.execute(last_job_stmt)).scalar_one_or_none()
 
                 if last_job is None:
-                    # No completed backup at all — dispatch an initial full backup
                     await _dispatch_backup(db, source.id, source.path, "full")
                     continue
 
@@ -91,7 +116,6 @@ async def evaluate_all_policies() -> None:
 
                 elapsed_minutes = (now - completed_at).total_seconds() / 60
 
-                # Check if backup is overdue
                 if elapsed_minutes >= policy.frequency_minutes:
                     logger.info(
                         "Dispatching scheduled backup for source %d (overdue by %.1f min)",
@@ -100,7 +124,6 @@ async def evaluate_all_policies() -> None:
                     )
                     await _dispatch_backup(db, source.id, source.path, "incremental")
 
-                # Check RPO violation
                 if elapsed_minutes > policy.rpo_minutes:
                     logger.warning(
                         "RPO violation for source %d: %.1f min since last backup (limit %d min)",
@@ -121,7 +144,6 @@ async def evaluate_all_policies() -> None:
                     )
                     db.add(alert)
 
-                # Check for backup gap (missed multiple consecutive windows)
                 if elapsed_minutes > 3 * policy.frequency_minutes:
                     gap_alert = AnomalyAlert(
                         source_id=source.id,
@@ -139,6 +161,102 @@ async def evaluate_all_policies() -> None:
             await db.commit()
     except Exception:
         logger.exception("Error in evaluate_all_policies")
+
+
+# ---------------------------------------------------------------------------
+# Retention / GC job
+# ---------------------------------------------------------------------------
+
+
+async def prune_expired_snapshots() -> None:
+    """
+    Triggered every 60 minutes by APScheduler.
+
+    Deletes snapshots older than the source's policy retention_days, then
+    garbage-collects CAS chunks that are no longer referenced by any snapshot.
+    The most-recent snapshot for each source is always kept regardless of age.
+    """
+    from app.models.backup import BackupChunk, BackupSnapshot
+    from app.models.policy import BackupPolicy, PolicyAttachment
+    from app.models.source import DataSource
+
+    SessionFactory = _get_session_factory()
+    now = datetime.now(timezone.utc)
+
+    try:
+        async with SessionFactory() as db:
+            stmt = (
+                select(PolicyAttachment, BackupPolicy, DataSource)
+                .join(BackupPolicy, PolicyAttachment.policy_id == BackupPolicy.id)
+                .join(DataSource, PolicyAttachment.source_id == DataSource.id)
+                .where(BackupPolicy.is_active == True)
+            )
+            rows = (await db.execute(stmt)).all()
+
+            pruned_total = 0
+            for attachment, policy, source in rows:
+                retention_cutoff = now - timedelta(days=policy.retention_days)
+
+                # Most-recent snapshot — never prune this one
+                most_recent_stmt = (
+                    select(BackupSnapshot.id)
+                    .where(BackupSnapshot.source_id == source.id)
+                    .order_by(BackupSnapshot.created_at.desc())
+                    .limit(1)
+                )
+                most_recent_id = (await db.execute(most_recent_stmt)).scalar_one_or_none()
+
+                expired_stmt = (
+                    select(BackupSnapshot)
+                    .where(
+                        BackupSnapshot.source_id == source.id,
+                        BackupSnapshot.created_at < retention_cutoff,
+                    )
+                    .order_by(BackupSnapshot.created_at.asc())
+                )
+                expired_snapshots = (await db.execute(expired_stmt)).scalars().all()
+
+                for snapshot in expired_snapshots:
+                    if snapshot.id == most_recent_id:
+                        continue
+
+                    # Collect chunk hashes before cascade-delete removes them
+                    chunk_hashes_stmt = select(BackupChunk.chunk_hash).where(
+                        BackupChunk.snapshot_id == snapshot.id
+                    )
+                    chunk_hashes = list(
+                        (await db.execute(chunk_hashes_stmt)).scalars().all()
+                    )
+
+                    # Delete snapshot (ORM cascade removes BackupChunk + SnapshotFile)
+                    await db.delete(snapshot)
+                    await db.flush()
+
+                    # GC: delete CAS chunks with no remaining DB references
+                    from app.core.cas import CASStore
+
+                    cas_store = CASStore(settings.cas_store_path)
+                    for chunk_hash in chunk_hashes:
+                        still_ref_stmt = (
+                            select(BackupChunk.id)
+                            .where(BackupChunk.chunk_hash == chunk_hash)
+                            .limit(1)
+                        )
+                        if (await db.execute(still_ref_stmt)).scalar_one_or_none() is None:
+                            cas_store.delete(chunk_hash)
+
+                    pruned_total += 1
+
+            await db.commit()
+            if pruned_total:
+                logger.info("Retention pruner: removed %d expired snapshots", pruned_total)
+    except Exception:
+        logger.exception("Error in prune_expired_snapshots")
+
+
+# ---------------------------------------------------------------------------
+# Dispatch helper
+# ---------------------------------------------------------------------------
 
 
 async def _dispatch_backup(
@@ -188,8 +306,14 @@ def start_scheduler() -> None:
         id="policy_evaluator",
         replace_existing=True,
     )
+    scheduler.add_job(
+        prune_expired_snapshots,
+        IntervalTrigger(minutes=60),
+        id="retention_pruner",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info("APScheduler started — policy evaluation every 5 minutes")
+    logger.info("APScheduler started — policy evaluation every 5 min, retention pruning every 60 min")
 
 
 def stop_scheduler() -> None:

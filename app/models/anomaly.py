@@ -20,6 +20,7 @@ class AlertType(str, enum.Enum):
     size_anomaly = "size_anomaly"
     checksum_mismatch = "checksum_mismatch"
     rpo_violation = "rpo_violation"
+    dedup_ratio_collapse = "dedup_ratio_collapse"
 
 
 class AnomalyAlert(Base):

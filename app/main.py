@@ -2,25 +2,23 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.core.config import settings
 from app.core.database import init_db
 from app.core.rate_limit import RateLimiter
 import app.core.rate_limit as rate_limit_module
+from app.core.scheduler import start_scheduler, stop_scheduler
 from app.api import auth, sources, backups, policies, anomalies, restore, ws
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialise database tables
     await init_db()
-
-    # Initialise rate limiter singleton
     rate_limit_module.rate_limiter = RateLimiter(settings.redis_url)
-
+    start_scheduler()
     yield
-
-    # Teardown
+    stop_scheduler()
     if rate_limit_module.rate_limiter is not None:
         await rate_limit_module.rate_limiter.close()
 
@@ -31,6 +29,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Expose Prometheus metrics at /metrics
+Instrumentator().instrument(app).expose(app)
 
 app.add_middleware(
     CORSMiddleware,
