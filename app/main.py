@@ -9,7 +9,7 @@ from app.core.database import init_db
 from app.core.rate_limit import RateLimiter
 import app.core.rate_limit as rate_limit_module
 from app.core.scheduler import start_scheduler, stop_scheduler
-from app.api import auth, sources, backups, policies, anomalies, restore, ws, snapshots, analytics, catalog, browse, chain, webhooks
+from app.api import auth, sources, backups, policies, anomalies, restore, ws, snapshots, analytics, catalog, browse, chain, webhooks, compliance
 
 
 @asynccontextmanager
@@ -52,6 +52,7 @@ app.include_router(catalog.router, prefix="/api/v1/sources", tags=["Catalog"])
 app.include_router(browse.router, prefix="/api/v1/sources", tags=["Browse"])
 app.include_router(chain.router, prefix="/api/v1/sources", tags=["Chain"])
 app.include_router(webhooks.router, prefix="/api/v1/webhooks", tags=["Webhooks"])
+app.include_router(compliance.router, prefix="/api/v1/compliance", tags=["Compliance"])
 app.include_router(ws.router, prefix="/ws", tags=["WebSocket"])
 
 
