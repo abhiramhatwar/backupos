@@ -220,6 +220,15 @@ async def prune_expired_snapshots() -> None:
                     if snapshot.id == most_recent_id:
                         continue
 
+                    # Respect WORM immutable lock
+                    if snapshot.locked_until and snapshot.locked_until > now:
+                        logger.debug(
+                            "Skipping locked snapshot %d (locked until %s)",
+                            snapshot.id,
+                            snapshot.locked_until.isoformat(),
+                        )
+                        continue
+
                     # Collect chunk hashes before cascade-delete removes them
                     chunk_hashes_stmt = select(BackupChunk.chunk_hash).where(
                         BackupChunk.snapshot_id == snapshot.id
@@ -252,6 +261,87 @@ async def prune_expired_snapshots() -> None:
                 logger.info("Retention pruner: removed %d expired snapshots", pruned_total)
     except Exception:
         logger.exception("Error in prune_expired_snapshots")
+
+
+# ---------------------------------------------------------------------------
+# Automated recovery verification job
+# ---------------------------------------------------------------------------
+
+
+async def verify_snapshot_integrity() -> None:
+    """
+    Triggered daily by APScheduler.
+
+    Finds snapshots that have never been verified, or were last verified more
+    than 7 days ago, and recomputes their Merkle root from SnapshotFile
+    manifests.  Any mismatch is logged as a WARNING and recorded in
+    verification_status so operators can act on it.
+
+    Up to 100 snapshots are processed per run to keep the job bounded.
+    """
+    from app.models.backup import BackupSnapshot, SnapshotFile
+    from app.models.source import DataSource
+
+    SessionFactory = _get_session_factory()
+    now = datetime.now(timezone.utc)
+    verify_cutoff = now - timedelta(days=7)
+
+    try:
+        async with SessionFactory() as db:
+            stmt = (
+                select(BackupSnapshot)
+                .join(DataSource, BackupSnapshot.source_id == DataSource.id)
+                .where(
+                    (BackupSnapshot.last_verified_at == None)  # noqa: E711
+                    | (BackupSnapshot.last_verified_at < verify_cutoff)
+                )
+                .order_by(BackupSnapshot.created_at.desc())
+                .limit(100)
+            )
+            snapshots = (await db.execute(stmt)).scalars().all()
+
+            verified = 0
+            failed = 0
+            for snapshot in snapshots:
+                sf_result = await db.execute(
+                    select(SnapshotFile)
+                    .where(SnapshotFile.snapshot_id == snapshot.id)
+                    .order_by(SnapshotFile.id)
+                )
+                sf_records = sf_result.scalars().all()
+                if not sf_records:
+                    continue  # skip pre-SnapshotFile legacy snapshots
+
+                from app.core.merkle import MerkleTree
+
+                chunk_hashes = [h for sf in sf_records for h in sf.get_chunk_hashes()]
+                computed_root = MerkleTree(chunk_hashes).root_hash
+                is_valid = computed_root == snapshot.merkle_root
+
+                snapshot.last_verified_at = now
+                snapshot.verification_status = "passed" if is_valid else "failed"
+
+                if is_valid:
+                    verified += 1
+                else:
+                    failed += 1
+                    logger.warning(
+                        "Integrity check FAILED for snapshot %d (source %d): "
+                        "stored=%s computed=%s",
+                        snapshot.id,
+                        snapshot.source_id,
+                        snapshot.merkle_root,
+                        computed_root,
+                    )
+
+            await db.commit()
+            logger.info(
+                "Snapshot integrity verification: %d passed, %d failed",
+                verified,
+                failed,
+            )
+    except Exception:
+        logger.exception("Error in verify_snapshot_integrity")
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +402,17 @@ def start_scheduler() -> None:
         id="retention_pruner",
         replace_existing=True,
     )
+    scheduler.add_job(
+        verify_snapshot_integrity,
+        IntervalTrigger(days=1),
+        id="integrity_verifier",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info("APScheduler started — policy evaluation every 5 min, retention pruning every 60 min")
+    logger.info(
+        "APScheduler started — policy evaluation every 5 min, "
+        "retention pruning every 60 min, integrity verification daily"
+    )
 
 
 def stop_scheduler() -> None:

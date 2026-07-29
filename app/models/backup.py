@@ -52,6 +52,9 @@ class BackupSnapshot(Base):
     new_chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     average_entropy: Mapped[float] = mapped_column(default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    locked_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    verification_status: Mapped[str] = mapped_column(String(20), nullable=True)
 
     job = relationship("BackupJob", back_populates="snapshot")
     chunks = relationship("BackupChunk", back_populates="snapshot", cascade="all, delete-orphan")

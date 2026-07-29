@@ -38,6 +38,9 @@ class SnapshotResponse(BaseModel):
     new_chunk_count: int
     average_entropy: float
     created_at: datetime
+    locked_until: Optional[datetime] = None
+    last_verified_at: Optional[datetime] = None
+    verification_status: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
