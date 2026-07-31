@@ -64,13 +64,20 @@ def local_path(rel):     return os.path.join(_LOCAL_DATA, rel)
 def container_path(rel): return f"{_CONTAINER_DATA}/{rel}"
 
 
-def write_text_files(rel_dir, n, salt=""):
-    """Low-entropy text files (~4-5 bits/byte) — the 'normal' baseline."""
+def write_text_files(rel_dir, n):
+    """
+    Write n low-entropy text files (~4-5 bits/byte) — the 'normal' baseline.
+
+    File content is deterministic per index, so calling this again with a
+    larger n leaves the existing files byte-identical and only adds new ones.
+    That is what lets deduplication kick in: unchanged files reuse the chunks
+    already in the CAS, and only the added file's chunks are stored.
+    """
     d = local_path(rel_dir)
     os.makedirs(d, exist_ok=True)
     for i in range(n):
         with open(os.path.join(d, f"record_{i:02d}.txt"), "w") as f:
-            f.write(f"BackupOS customer record {i}{salt}\n")
+            f.write(f"BackupOS customer record {i}\n")
             f.write("name: Jane Doe\nplan: enterprise\nregion: us-east-1\n")
             f.write(("data field with repeating content, " * 20 + "\n") * 8)
 
@@ -179,13 +186,13 @@ step("Full backup (establishes baseline)")
 run_backup(client, headers, src_a, "full")
 
 for round_no in range(1, 4):
-    step(f"Incremental #{round_no} (add a file + small edits → high dedup)")
-    write_text_files("prod_docs", n=8 + round_no, salt=f" v{round_no}")  # mostly-identical data
+    step(f"Incremental #{round_no} (add one file, rest unchanged → high dedup)")
+    write_text_files("prod_docs", n=8 + round_no)  # existing files identical, one new file
     job = run_backup(client, headers, src_a, "incremental")
     snap = latest_snapshot(client, headers, src_a)
     if snap:
         info(f"snapshot #{snap['id']}  dedup={snap['dedup_ratio']*100:.0f}%  "
-             f"entropy={snap['average_entropy']:.2f}  chunks={snap['chunk_count']} (+{snap['new_chunk_count']})")
+             f"entropy={snap['average_entropy']:.2f}  chunks={snap['chunk_count']} (+{snap['new_chunk_count']} new)")
 
 # 4. SOURCE B — clean history, then a ransomware attack ------------------
 banner("Source B — Customer DB Exports (about to be attacked)")
@@ -196,8 +203,8 @@ step("Full backup (clean baseline)")
 run_backup(client, headers, src_b, "full")
 
 for round_no in range(1, 4):
-    step(f"Incremental #{round_no} (normal daily backup)")
-    write_text_files("db_exports", n=10, salt=f" day{round_no}")
+    step(f"Incremental #{round_no} (normal daily backup, data unchanged → ~full dedup)")
+    write_text_files("db_exports", n=10)
     run_backup(client, headers, src_b, "incremental")
     snap = latest_snapshot(client, headers, src_b)
     if snap:

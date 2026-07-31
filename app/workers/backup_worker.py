@@ -183,7 +183,12 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
             # ------------------------------------------------------------------
             avg_entropy = (sum(chunk_entropies) / len(chunk_entropies)) if chunk_entropies else 0.0
             total_size = sum(chunk_sizes)
-            dedup_size = sum(s for s, is_new in zip(chunk_sizes, chunk_is_new) if not is_new)
+            # dedup_size_bytes = logical bytes that were unique to this snapshot
+            # (i.e. actually had to be stored).  Inherited chunks that already
+            # existed in the CAS contribute nothing.  This makes the derived
+            # dedup ratio  saved/total = (total - unique)/total  the fraction of
+            # data avoided by deduplication, matching the schema and analytics.
+            dedup_size = sum(s for s, is_new in zip(chunk_sizes, chunk_is_new) if is_new)
             new_count = len(new_hashes)
 
             # ------------------------------------------------------------------
@@ -301,27 +306,33 @@ def run_backup(self, job_id: int, source_path: str, source_id: int, backup_type:
                 entropy_alert_fired = True
 
             # --- Dedup-ratio collapse detection ---
+            # The dedup *reuse* ratio is the fraction of a snapshot's data that
+            # was already present in the CAS (deduplicated away):
+            #     reuse = 1 - unique_bytes / total_bytes
+            # Healthy incremental backups reuse most of their data (high reuse).
+            # A ransomware attack that re-encrypts everything produces all-new
+            # chunks, so reuse collapses toward zero — a strong tamper signal.
             if prev_snapshots and total_size > 0:
-                recent_ratios = [
-                    s.dedup_size_bytes / s.total_size_bytes
+                recent_reuse = [
+                    1.0 - (s.dedup_size_bytes / s.total_size_bytes)
                     for s in prev_snapshots
                     if s.total_size_bytes > 0
                 ]
-                if len(recent_ratios) >= 3:
-                    avg_dedup_ratio = sum(recent_ratios) / len(recent_ratios)
-                    current_dedup_ratio = dedup_size / total_size
-                    if avg_dedup_ratio > 0.3 and current_dedup_ratio < avg_dedup_ratio * 0.3:
+                if len(recent_reuse) >= 3:
+                    avg_reuse = sum(recent_reuse) / len(recent_reuse)
+                    current_reuse = 1.0 - (dedup_size / total_size)
+                    if avg_reuse > 0.3 and current_reuse < avg_reuse * 0.3:
                         dedup_alert = AnomalyAlert(
                             source_id=source_id,
                             alert_type=AlertType.dedup_ratio_collapse,
                             severity=AlertSeverity.high,
                             detail=(
-                                f"Dedup ratio collapsed from rolling avg {avg_dedup_ratio:.1%} "
-                                f"to {current_dedup_ratio:.1%}. Data may have been re-encrypted "
+                                f"Dedup reuse collapsed from rolling avg {avg_reuse:.1%} "
+                                f"to {current_reuse:.1%}. Data may have been re-encrypted "
                                 f"or replaced wholesale — possible ransomware activity."
                             ),
-                            metric_value=current_dedup_ratio,
-                            threshold_value=avg_dedup_ratio * 0.3,
+                            metric_value=current_reuse,
+                            threshold_value=avg_reuse * 0.3,
                         )
                         db.add(dedup_alert)
 
