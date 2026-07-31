@@ -2,7 +2,29 @@
 
 A production-grade distributed backup engine that implements the core algorithms inside a cloud data protection system — content-defined chunking with Rabin fingerprinting, Merkle-tree snapshot verification, Shannon entropy ransomware detection, and a Celery-backed job orchestrator with real-time WebSocket streaming.
 
-This is not a thin wrapper around cloud storage. It implements the hard parts from scratch.
+This is not a thin wrapper around cloud storage. It implements the hard parts from scratch. It ships with a full web dashboard and a one-command demo that simulates a ransomware attack and shows the detectors firing in real time.
+
+---
+
+## Quickstart
+
+Four commands from a clean checkout to a fully-populated dashboard:
+
+```bash
+git clone https://github.com/abhiramhatwar/backupos
+cd backupos
+docker-compose up -d --build          # build & start api, worker, postgres, redis
+docker-compose exec api python scripts/demo.py   # seed data + simulate a ransomware attack
+```
+
+Then open **http://localhost:8000** and sign in:
+
+```
+email:    demo@backupos.io
+password: demo-password-123
+```
+
+> First build takes ~1–2 minutes. Wait for `docker-compose exec` to succeed (it retries the API automatically). If the dashboard shows nothing, give the API ~10s after `up` and refresh.
 
 ---
 
@@ -33,6 +55,9 @@ This is not a thin wrapper around cloud storage. It implements the hard parts fr
   - [Option B — Local Python](#option-b--local-python-no-docker)
   - [First API call](#first-api-call--register-and-authenticate)
   - [End-to-end walkthrough](#end-to-end-walkthrough)
+- [The dashboard](#the-dashboard)
+- [The demo & ransomware simulation](#the-demo--ransomware-simulation)
+- [Common operations](#common-operations)
 - [API reference](#api-reference)
 - [Policy format](#policy-format)
 - [Compliance framework mapping](#compliance-framework-mapping)
@@ -346,17 +371,19 @@ docker-compose up --build
 
 This command builds and starts four containers:
 
-| Container | Role | Port |
+| Container | Role | Host port |
 |---|---|---|
-| `db` | PostgreSQL 16 | 5432 (internal) |
-| `redis` | Redis 7 | 6379 (internal) |
+| `postgres` | PostgreSQL 16 | **5433** → 5432 |
+| `redis` | Redis 7 | 6379 |
 | `api` | FastAPI + Uvicorn | **8000** |
 | `worker` | Celery worker pool (4 processes) | — |
 
-Database migrations run automatically the moment the API container starts. Wait for this log line before making requests:
+> The Postgres container is published on host port **5433** (not 5432) so it never collides with a Postgres you may already run locally. Inside the Docker network the services still talk to it on `postgres:5432`.
+
+The schema is created automatically the moment the API container starts. Wait for this log line before making requests:
 
 ```
-api_1     | INFO:     Application startup complete.
+api-1     | INFO:     Application startup complete.
 ```
 
 **Verify it's healthy:**
@@ -366,7 +393,16 @@ curl http://localhost:8000/health
 # {"status":"ok","service":"BackupOS"}
 ```
 
-Open the interactive API explorer: **http://localhost:8000/docs**
+Now open one of:
+
+| URL | What |
+|---|---|
+| **http://localhost:8000** | The web dashboard (sign in / register) |
+| http://localhost:8000/docs | Interactive Swagger API explorer |
+| http://localhost:8000/redoc | ReDoc API reference |
+| http://localhost:8000/metrics | Prometheus metrics |
+
+The fastest way to see everything working is to seed demo data — jump to [The demo & ransomware simulation](#the-demo--ransomware-simulation).
 
 ---
 
@@ -419,10 +455,10 @@ The API is now at **http://localhost:8000**. Without the Celery worker, backup a
 All protected endpoints require a JWT. Create an account first:
 
 ```bash
-# Register a tenant
+# Register a tenant (name, email, and password are all required)
 curl -s -X POST http://localhost:8000/api/v1/auth/register \
   -H "Content-Type: application/json" \
-  -d '{"email":"admin@example.com","password":"password123"}' | jq .
+  -d '{"name":"Acme Corp","email":"admin@example.com","password":"password123"}' | jq .
 
 # Get a JWT
 TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/token \
@@ -507,21 +543,81 @@ curl -s "http://localhost:8000/api/v1/compliance/audit-export" \
 
 ---
 
-### Run the automated demo
+---
 
-With Docker running:
+## The dashboard
+
+A single-page web UI is served from the API root at **http://localhost:8000**. It talks to the same `/api/v1` endpoints documented below, authenticates with a JWT stored in the browser, and streams live backup progress over the WebSocket.
+
+Sign in on the landing screen (or register a new org). After seeding the demo, use `demo@backupos.io` / `demo-password-123`.
+
+| Tab | What it shows |
+|---|---|
+| **Overview** | Stat cards (sources, jobs, snapshots, open alerts), a compliance-score gauge, and the most recent backup jobs |
+| **Sources** | Register / delete data sources (directory, file, database) with a data classification |
+| **Backups** | Trigger a backup and watch **live progress bars driven by the WebSocket** (`/ws/jobs/{id}`) |
+| **Snapshots** | Per-source Merkle chain — dedup %, chunk counts, entropy, Merkle root, RPO/RTO recovery metrics, plus **verify** (recomputes the Merkle root) and **WORM lock** buttons |
+| **Analytics** | Chart.js deduplicated-vs-raw storage growth chart + OLS capacity projection (30/90-day) |
+| **Ransomware** | Shannon-entropy meter (0–8 bits/byte) and the list of active anomaly alerts, each resolvable inline |
+| **Policies** | Policy-as-code YAML editor — create policies and attach them to sources |
+| **Compliance** | SOC 2 / HIPAA / PCI-DSS score per source with the full violation trail |
+
+The dashboard is plain HTML + vanilla JS (`web/index.html`, `web/app.js`) with Tailwind and Chart.js from CDNs — no build step. The API auto-reloads on edits to these files.
+
+---
+
+## The demo & ransomware simulation
+
+`scripts/demo.py` seeds a realistic dataset so every dashboard tab is populated, and it stages a **simulated ransomware attack** to prove the detectors work.
+
+Run it inside the `api` container so it shares the code bind-mount with the Celery worker (this is what makes the backed-up files visible to the worker):
 
 ```bash
 docker-compose exec api python scripts/demo.py
 ```
 
-Or locally (with the API on port 8000):
+What it does:
 
-```bash
-python scripts/demo.py
+1. Registers the tenant `demo@backupos.io` and logs in
+2. Creates a **Tier-1 Critical** policy (120-min RPO, 30-day retention, entropy threshold 7.5) and attaches it to both sources
+3. **Source A — "Production Documents"**: a full backup followed by three incrementals that each add one file while leaving the rest unchanged, so you can watch the deduplication ratio climb (≈89% → 91%)
+4. **Source B — "Customer DB Exports"**: a clean full + three identical daily incrementals (≈100% dedup), then it **overwrites every file with random bytes** to imitate ransomware encryption and runs one more backup
+5. That final backup trips two independent detectors:
+   - `entropy_spike` **(CRITICAL)** — average entropy jumps to ~7.9 bits/byte; the chi-squared test confirms the data is encrypted rather than merely compressed
+   - `dedup_ratio_collapse` **(HIGH)** — chunk reuse collapses from ~100% to 0%
+6. Prints recovery metrics and the compliance report (the attacked PII source scores lower)
+
+Example tail of the output:
+
+```
+▶ Nightly incremental backup runs against the encrypted data…
+    snapshot #9  dedup=0%  entropy=7.86 bits/byte  ← SPIKE
+
+  ✓ 2 anomaly alert(s) raised:
+    [HIGH    ] dedup_ratio_collapse: Dedup reuse collapsed from rolling avg 100.0% to 0.0% …
+    [CRITICAL] entropy_spike: High entropy detected: avg=7.859 bits/byte … Chi-squared p=0.70 → ENCRYPTED …
+
+  ✓ Overall compliance score: 85.2/100 (2 violations, 1 critical alerts)
 ```
 
-The script registers a tenant, creates a source and policy, runs full and incremental backups, synthesizes a chain-free full snapshot, searches the catalog, and prints a compliance report.
+The demo is idempotent on the tenant/policy but adds fresh snapshots each run. To start completely clean, reset the volumes first (see below).
+
+---
+
+## Common operations
+
+| Goal | Command |
+|---|---|
+| Build & start (detached) | `docker-compose up -d --build` |
+| Seed demo data | `docker-compose exec api python scripts/demo.py` |
+| Follow logs | `docker-compose logs -f api worker` |
+| Stop (keep data) | `docker-compose stop` |
+| Start again | `docker-compose start` |
+| Restart the worker after editing `app/workers/**` | `docker-compose restart worker` |
+| **Full reset** (wipe DB + all backups) | `docker-compose down -v` then `up -d` again |
+| Run the test suite | `docker-compose exec api python -m pytest -q` |
+
+> The **API auto-reloads** on Python/HTML/JS edits (`--reload`). The **Celery worker does not** — after changing anything under `app/workers/`, run `docker-compose restart worker`.
 
 ---
 
@@ -735,53 +831,16 @@ tests/test_compliance_export.py  10 tests  — signed export, verify endpoint, s
 208 tests total, 0 failures
 ```
 
+Run the same suite inside Docker (no local Python needed):
+
+```bash
+docker-compose exec api python -m pytest -q
+```
+
 With coverage:
 
 ```bash
 pytest tests/ --cov=app --cov-report=term-missing
 ```
 
----
-
-## Demo script
-
-With the stack running (`docker-compose up -d`):
-
-```bash
-python scripts/demo.py
-```
-
-The script:
-1. Registers a tenant and obtains a JWT
-2. Creates a data source pointing at `/tmp/demo_data`
-3. Creates a backup policy (60-minute frequency, 30-day retention, 120-minute RPO)
-4. Attaches the policy to the source
-5. Writes 5 sample files (~5 KB each) to the source directory
-6. Triggers a **full backup** and polls until complete
-7. Appends data to one file, then triggers an **incremental backup** — only changed chunks are transferred
-8. Fetches recovery metrics (current RPO, estimated RTO, total snapshot count)
-9. Synthesizes a full snapshot from the incremental chain
-10. Searches the backup catalog for `*.txt` files
-11. Prints the storage analytics report (dedup ratio, compression savings, growth projection)
-12. Prints the full compliance report
-
-Example output:
-
-```
-============================================================
-  BackupOS End-to-End Demo
-============================================================
-
-[6] Triggering full backup …
-    OK  Backup job created: id=1, status=pending
-[7] Polling backup job status …
-    OK  Job finished with status: completed
-[9] Triggering incremental backup …
-    OK  Incremental job finished with status: completed
-[11] Synthesizing full snapshot …
-    OK  Synthetic snapshot id=3, 5 files, 12 chunks, no chain dependency
-[12] Generating compliance report …
-    OK  Overall compliance score: 100.0 / 100
-    OK  Total violations: 0
-    OK  Source 'Demo Files': overall=100.0  SOC2=100.0  HIPAA=100.0  PCI=100.0
-```
+The end-to-end demo and ransomware simulation are documented in [The demo & ransomware simulation](#the-demo--ransomware-simulation).
