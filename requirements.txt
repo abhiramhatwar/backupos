@@ -21,4 +21,4 @@ psycopg2-binary==2.9.10
 aiosqlite==0.20.0
 starlette==0.41.3
 zstandard==0.23.0
-prometheus-fastapi-instrumentator==8.1.0
+prometheus-fastapi-instrumentator==7.0.0
