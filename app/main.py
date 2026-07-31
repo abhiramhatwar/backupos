@@ -1,7 +1,10 @@
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.core.config import settings
@@ -59,3 +62,16 @@ app.include_router(ws.router, prefix="/ws", tags=["WebSocket"])
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "BackupOS"}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard (single-page app served from web/)
+# ---------------------------------------------------------------------------
+_WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
+
+if os.path.isdir(_WEB_DIR):
+    app.mount("/static", StaticFiles(directory=_WEB_DIR), name="static")
+
+    @app.get("/", include_in_schema=False)
+    async def dashboard():
+        return FileResponse(os.path.join(_WEB_DIR, "index.html"))

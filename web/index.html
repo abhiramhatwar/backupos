@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BackupOS — Distributed Backup Engine</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  <style>
+    body { background:#0b1120; color:#e2e8f0; font-family:ui-sans-serif,system-ui,sans-serif; }
+    .card { background:#111a2e; border:1px solid #1e293b; border-radius:.75rem; }
+    .fade-in { animation:fadeIn .3s ease; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+    .tab-btn { padding:.4rem 1rem; border-radius:.5rem; font-size:.8rem; font-weight:600; transition:all .15s; color:#94a3b8; white-space:nowrap; }
+    .tab-btn.active { background:#1e293b; color:#f1f5f9; }
+    .tab-btn:hover:not(.active) { color:#cbd5e1; }
+    .btn { border-radius:.5rem; font-weight:600; transition:all .15s; }
+    .btn-primary { background:#2563eb; color:#fff; } .btn-primary:hover { background:#3b82f6; }
+    .btn-ghost { border:1px solid #334155; color:#cbd5e1; } .btn-ghost:hover { background:#1e293b; }
+    .input { background:#0b1120; border:1px solid #334155; border-radius:.5rem; padding:.5rem .75rem; font-size:.85rem; color:#f1f5f9; width:100%; }
+    .input:focus { outline:none; border-color:#3b82f6; }
+    .badge { font-size:.65rem; font-weight:700; padding:.15rem .5rem; border-radius:.3rem; text-transform:uppercase; letter-spacing:.02em; }
+    .progress-track { height:6px; border-radius:3px; background:#1e293b; overflow:hidden; }
+    .progress-fill { height:6px; border-radius:3px; background:#3b82f6; transition:width .4s ease; }
+    .entropy-bar { height:8px; border-radius:4px; background:linear-gradient(90deg,#22c55e 0%,#eab308 55%,#f97316 78%,#ef4444 100%); position:relative; }
+    .entropy-marker { position:absolute; top:-3px; width:3px; height:14px; background:#f1f5f9; border-radius:2px; box-shadow:0 0 4px rgba(0,0,0,.6); transition:left .4s; }
+    .toast { position:fixed; bottom:1.5rem; right:1.5rem; z-index:60; padding:.75rem 1.25rem; border-radius:.5rem; font-size:.85rem; font-weight:600; box-shadow:0 6px 30px rgba(0,0,0,.5); animation:fadeIn .25s ease; }
+    table { width:100%; border-collapse:collapse; }
+    th { text-align:left; font-size:.65rem; text-transform:uppercase; letter-spacing:.04em; color:#64748b; font-weight:600; padding:.5rem .75rem; }
+    td { padding:.6rem .75rem; font-size:.82rem; border-top:1px solid #1e293b; }
+    tr:hover td { background:#0e1626; }
+    .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    ::-webkit-scrollbar { width:8px; height:8px; } ::-webkit-scrollbar-thumb { background:#1e293b; border-radius:4px; }
+    select.input { appearance:none; }
+  </style>
+</head>
+<body class="min-h-screen">
+
+<!-- ══════════════ AUTH GATE ══════════════ -->
+<div id="auth-screen" class="min-h-screen flex items-center justify-center p-6">
+  <div class="card p-8 w-full max-w-md fade-in">
+    <div class="flex items-center gap-3 mb-1">
+      <div class="w-9 h-9 rounded-lg bg-blue-600 flex items-center justify-center font-bold text-white">B</div>
+      <h1 class="text-xl font-bold text-white">BackupOS</h1>
+    </div>
+    <p class="text-slate-400 text-sm mb-6">Distributed backup engine — dedup, Merkle chains, ransomware detection.</p>
+
+    <div class="flex gap-2 mb-5">
+      <button id="auth-tab-login"    class="tab-btn active flex-1" onclick="switchAuth('login')">Sign In</button>
+      <button id="auth-tab-register" class="tab-btn flex-1"        onclick="switchAuth('register')">Register</button>
+    </div>
+
+    <form id="auth-form" class="space-y-3">
+      <div id="reg-name-field" class="hidden">
+        <label class="text-xs text-slate-400 block mb-1">Organization Name</label>
+        <input id="auth-name" type="text" class="input" placeholder="Acme Corp" />
+      </div>
+      <div>
+        <label class="text-xs text-slate-400 block mb-1">Email</label>
+        <input id="auth-email" type="email" class="input" placeholder="you@company.com" />
+      </div>
+      <div>
+        <label class="text-xs text-slate-400 block mb-1">Password</label>
+        <input id="auth-password" type="password" class="input" placeholder="••••••••" />
+      </div>
+      <button type="submit" id="auth-submit" class="btn btn-primary w-full py-2.5 mt-2">Sign In</button>
+    </form>
+    <div id="auth-error" class="text-red-400 text-xs mt-3 hidden"></div>
+    <p class="text-slate-600 text-xs mt-5 text-center">Multi-tenant · JWT auth · rate-limited API</p>
+  </div>
+</div>
+
+<!-- ══════════════ APP ══════════════ -->
+<div id="app-screen" class="hidden max-w-6xl mx-auto p-6 space-y-6">
+
+  <!-- Header -->
+  <div class="flex items-center justify-between flex-wrap gap-3">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-blue-600 flex items-center justify-center font-bold text-white">B</div>
+      <div>
+        <h1 class="text-lg font-bold text-white leading-tight">BackupOS</h1>
+        <p class="text-slate-500 text-xs" id="tenant-label">—</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <div class="flex items-center gap-1.5">
+        <div id="health-dot" class="w-2 h-2 rounded-full bg-slate-500"></div>
+        <span id="health-label" class="text-slate-400 text-xs">checking…</span>
+      </div>
+      <button onclick="refreshAll()" class="btn btn-ghost px-3 py-1.5 text-xs">Refresh</button>
+      <button onclick="logout()" class="btn btn-ghost px-3 py-1.5 text-xs">Sign out</button>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="flex gap-1.5 flex-wrap border-b border-slate-800 pb-3">
+    <button class="tab-btn active" onclick="switchTab('overview')">Overview</button>
+    <button class="tab-btn"        onclick="switchTab('sources')">Sources</button>
+    <button class="tab-btn"        onclick="switchTab('backups')">Backups</button>
+    <button class="tab-btn"        onclick="switchTab('snapshots')">Snapshots</button>
+    <button class="tab-btn"        onclick="switchTab('analytics')">Analytics</button>
+    <button class="tab-btn"        onclick="switchTab('ransomware')">Ransomware</button>
+    <button class="tab-btn"        onclick="switchTab('policies')">Policies</button>
+    <button class="tab-btn"        onclick="switchTab('compliance')">Compliance</button>
+  </div>
+
+  <!-- ── Overview ── -->
+  <div id="tab-overview" class="space-y-4">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div class="card p-4"><div id="ov-sources"   class="text-2xl font-bold text-white">—</div><div class="text-slate-400 text-xs mt-1">Data Sources</div></div>
+      <div class="card p-4"><div id="ov-backups"   class="text-2xl font-bold text-blue-400">—</div><div class="text-slate-400 text-xs mt-1">Backup Jobs</div></div>
+      <div class="card p-4"><div id="ov-snapshots" class="text-2xl font-bold text-emerald-400">—</div><div class="text-slate-400 text-xs mt-1">Snapshots</div></div>
+      <div class="card p-4"><div id="ov-alerts"    class="text-2xl font-bold text-red-400">—</div><div class="text-slate-400 text-xs mt-1">Open Alerts</div></div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="card p-5 flex flex-col items-center justify-center">
+        <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3 self-start">Compliance Score</h2>
+        <svg viewBox="0 0 200 120" class="w-44">
+          <path d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="#1e293b" stroke-width="14" stroke-linecap="round"/>
+          <path id="comp-arc" d="M 20 100 A 80 80 0 0 1 180 100" fill="none" stroke="#22c55e" stroke-width="14" stroke-linecap="round" stroke-dasharray="251" stroke-dashoffset="251"/>
+          <text id="comp-score" x="100" y="94" text-anchor="middle" font-size="34" font-weight="700" fill="#f1f5f9">—</text>
+        </svg>
+        <div id="comp-sub" class="text-xs text-slate-500 mt-2">—</div>
+      </div>
+      <div class="card p-5 md:col-span-2">
+        <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Recent Backup Jobs</h2>
+        <div id="ov-recent" class="text-slate-500 text-sm">No jobs yet.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Sources ── -->
+  <div id="tab-sources" class="hidden space-y-4">
+    <div class="card p-5">
+      <h2 class="text-sm font-semibold text-slate-200 mb-4">Register a Data Source</h2>
+      <div class="grid grid-cols-1 md:grid-cols-5 gap-3">
+        <input id="src-name" class="input md:col-span-1" placeholder="Name" />
+        <input id="src-path" class="input md:col-span-2" placeholder="/app path to back up (e.g. /app/app)" />
+        <select id="src-type" class="input">
+          <option value="directory">directory</option>
+          <option value="file">file</option>
+          <option value="database">database</option>
+        </select>
+        <select id="src-class" class="input">
+          <option value="internal">internal</option>
+          <option value="public">public</option>
+          <option value="confidential">confidential</option>
+          <option value="pii">pii</option>
+          <option value="financial">financial</option>
+        </select>
+      </div>
+      <button onclick="createSource()" class="btn btn-primary px-4 py-2 text-sm mt-3">Add Source</button>
+      <p class="text-slate-600 text-xs mt-2">Tip: use a path that exists inside the container, e.g. <span class="mono">/app/app</span> or <span class="mono">/app/tests</span>.</p>
+    </div>
+    <div class="card overflow-hidden">
+      <div class="px-5 py-3 border-b border-slate-800"><h2 class="text-sm font-semibold text-slate-200">Sources</h2></div>
+      <div id="sources-list" class="p-5 text-slate-500 text-sm">Loading…</div>
+    </div>
+  </div>
+
+  <!-- ── Backups ── -->
+  <div id="tab-backups" class="hidden space-y-4">
+    <div class="card p-5">
+      <h2 class="text-sm font-semibold text-slate-200 mb-4">Trigger a Backup</h2>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+        <div>
+          <label class="text-xs text-slate-400 block mb-1">Source</label>
+          <select id="bk-source" class="input"></select>
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 block mb-1">Type</label>
+          <select id="bk-type" class="input">
+            <option value="incremental">incremental</option>
+            <option value="full">full</option>
+          </select>
+        </div>
+        <button onclick="triggerBackup()" class="btn btn-primary px-4 py-2 text-sm">Run Backup</button>
+      </div>
+    </div>
+    <div class="card overflow-hidden">
+      <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-slate-200">Backup Jobs</h2>
+        <span class="text-xs text-slate-500">live progress via WebSocket</span>
+      </div>
+      <div id="backups-list" class="p-5 text-slate-500 text-sm">Loading…</div>
+    </div>
+  </div>
+
+  <!-- ── Snapshots ── -->
+  <div id="tab-snapshots" class="hidden space-y-4">
+    <div class="card p-5">
+      <div class="flex items-end gap-3">
+        <div class="flex-1">
+          <label class="text-xs text-slate-400 block mb-1">Source</label>
+          <select id="snap-source" class="input" onchange="loadSnapshots()"></select>
+        </div>
+        <button onclick="loadSnapshots()" class="btn btn-ghost px-4 py-2 text-sm">Load</button>
+      </div>
+      <div id="recovery-metrics" class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4"></div>
+    </div>
+    <div class="card overflow-hidden">
+      <div class="px-5 py-3 border-b border-slate-800"><h2 class="text-sm font-semibold text-slate-200">Snapshot Chain</h2></div>
+      <div id="snapshots-list" class="p-5 text-slate-500 text-sm">Select a source.</div>
+    </div>
+  </div>
+
+  <!-- ── Analytics ── -->
+  <div id="tab-analytics" class="hidden space-y-4">
+    <div class="card p-5">
+      <div class="flex items-end gap-3">
+        <div class="flex-1">
+          <label class="text-xs text-slate-400 block mb-1">Source</label>
+          <select id="an-source" class="input" onchange="loadAnalytics()"></select>
+        </div>
+        <button onclick="loadAnalytics()" class="btn btn-ghost px-4 py-2 text-sm">Load</button>
+      </div>
+    </div>
+    <div id="an-stats" class="grid grid-cols-2 md:grid-cols-4 gap-4"></div>
+    <div class="card p-5">
+      <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Deduplicated Storage Growth</h2>
+      <canvas id="an-chart" height="90"></canvas>
+      <div id="an-projection" class="text-xs text-slate-500 mt-3"></div>
+    </div>
+  </div>
+
+  <!-- ── Ransomware ── -->
+  <div id="tab-ransomware" class="hidden space-y-4">
+    <div class="card p-5">
+      <h2 class="text-sm font-semibold text-slate-200 mb-1">Entropy-Based Ransomware Detection</h2>
+      <p class="text-slate-400 text-xs mb-4">Shannon entropy near <span class="mono">8.0 bits/byte</span> indicates encryption. A sudden spike across a source's chunks triggers an alert.</p>
+      <div class="flex items-center gap-3 text-xs text-slate-500 mb-1">
+        <span>0</span><div class="entropy-bar flex-1"><div id="entropy-marker" class="entropy-marker" style="left:0%"></div></div><span>8.0</span>
+      </div>
+      <div id="entropy-caption" class="text-xs text-slate-500 mt-2">No snapshot data yet.</div>
+    </div>
+    <div class="card overflow-hidden">
+      <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-slate-200">Active Alerts</h2>
+        <button onclick="loadAnomalies()" class="text-xs text-blue-400 hover:text-blue-300">Refresh</button>
+      </div>
+      <div id="anomalies-list" class="p-5 text-slate-500 text-sm">Loading…</div>
+    </div>
+  </div>
+
+  <!-- ── Policies ── -->
+  <div id="tab-policies" class="hidden space-y-4">
+    <div class="card p-5">
+      <h2 class="text-sm font-semibold text-slate-200 mb-4">Policy-as-Code</h2>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="space-y-3">
+          <input id="pol-name" class="input" placeholder="Policy name (e.g. Tier-1 Critical)" />
+          <input id="pol-desc" class="input" placeholder="Description" />
+          <textarea id="pol-yaml" rows="9" class="input mono text-xs resize-none">frequency_minutes: 60
+retention_days: 30
+rpo_minutes: 120
+require_checksum: true
+require_dedup: true
+entropy_threshold: 7.5</textarea>
+          <button onclick="createPolicy()" class="btn btn-primary px-4 py-2 text-sm">Create Policy</button>
+        </div>
+        <div>
+          <p class="text-xs text-slate-400 mb-2">Attach a policy to a source to enforce RPO and retention.</p>
+          <div class="flex gap-2 mb-3">
+            <select id="attach-policy" class="input"></select>
+            <select id="attach-source" class="input"></select>
+            <button onclick="attachPolicy()" class="btn btn-ghost px-3 py-2 text-sm whitespace-nowrap">Attach</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card overflow-hidden">
+      <div class="px-5 py-3 border-b border-slate-800"><h2 class="text-sm font-semibold text-slate-200">Policies</h2></div>
+      <div id="policies-list" class="p-5 text-slate-500 text-sm">Loading…</div>
+    </div>
+  </div>
+
+  <!-- ── Compliance ── -->
+  <div id="tab-compliance" class="hidden space-y-4">
+    <div class="card p-5 flex items-center justify-between">
+      <div>
+        <h2 class="text-sm font-semibold text-slate-200">Compliance Report</h2>
+        <p class="text-slate-400 text-xs mt-1">SOC 2 · HIPAA · PCI-DSS control mapping per source.</p>
+      </div>
+      <button onclick="loadCompliance()" class="btn btn-ghost px-4 py-2 text-sm">Generate</button>
+    </div>
+    <div id="compliance-body" class="text-slate-500 text-sm">Click Generate to build the report.</div>
+  </div>
+
+</div>
+
+<div id="toast-container"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
